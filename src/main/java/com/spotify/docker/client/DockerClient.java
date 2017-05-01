@@ -22,6 +22,8 @@
 package com.spotify.docker.client;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.spotify.docker.client.messages.Network.Type.BUILTIN;
+import static com.spotify.docker.client.messages.Network.Type.CUSTOM;
 
 import com.spotify.docker.client.exceptions.BadParamException;
 import com.spotify.docker.client.exceptions.ConflictException;
@@ -688,6 +690,14 @@ public interface DockerClient extends Closeable {
       return Objects.hash(name, value);
     }
   }
+  
+  /**
+   * Marker interface to designate a parameter as a filter parameter.
+   * Filter parameters receive special treatment during serialization:
+   * They are all rendered into the special 'filter' query parameter.
+   */
+  interface FilterParam {
+  }
 
   /**
    * Flags which can be passed to the <code>build</code> method.
@@ -991,9 +1001,7 @@ public interface DockerClient extends Closeable {
 
   /**
    * Kill a docker container.
-   * Note: This implementation deviates from the Docker Remote API. The
-   * latter accepts the kill signal as an argument. This implementation does
-   * not accept the signal argument; instead, the default SIGKILL is sent.
+   * Note: by default SIGKILL is sent.
    *
    * @param containerId The id of the container to kill.
    * @throws ContainerNotFoundException
@@ -1002,6 +1010,213 @@ public interface DockerClient extends Closeable {
    * @throws InterruptedException If the thread is interrupted
    */
   void killContainer(String containerId) throws DockerException, InterruptedException;
+
+  /**
+   * Kill a docker container.
+   * @param containerId The id of the container to kill.
+   * @param signal Signal used to kill the process.
+   * @throws ContainerNotFoundException
+   *                              if container is not found (404)
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void killContainer(final String containerId, final Signal signal)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Supported parameters for {@link #killContainer(String, Signal)}).
+   */
+  enum Signal {
+    /**
+     * Signal number: 1.
+     * Hangup (POSIX)
+     */
+    SIGHUP("SIGHUP"),
+
+    /**
+     * Signal number: 2.
+     * Terminal interrupt (ANSI)
+     */
+    SIGINT("SIGINT"),
+
+    /**
+     * Signal number: 3.
+     * Terminal quit (POSIX)
+     */
+    SIGQUIT("SIGQUIT"),
+
+    /**
+     * Signal number: 4.
+     * Illegal instruction (ANSI)
+     */
+    SIGILL("SIGILL"),
+
+    /**
+     * Signal number: 5.
+     * Trace trap (POSIX)
+     */
+    SIGTRAP("SIGTRAP"),
+
+    /**
+     * Signal number: 6.
+     * IOT trap (4.2 BSD)
+     */
+    SIGIOT("SIGIOT"),
+
+    /**
+     * Signal number: 7.
+     * BUS error (4.2 BSD)
+     */
+    SIGBUS("SIGBUS"),
+
+    /**
+     * Signal number: 8.
+     * Floating point exception (ANSI)
+     */
+    SIGFPE("SIGFPE"),
+
+    /**
+     * Signal number: 9.
+     * Kill (POSIX)
+     */
+    SIGKILL("SIGKILL"),
+
+    /**
+     * Signal number: 10.
+     * User defined signal 1 (POSIX)
+     */
+    SIGUSR1("SIGUSR1"),
+
+    /**
+     * Signal number: 11.
+     * Invalid memory segment address (ANSI)
+     */
+    SIGSEGV("SIGSEGV"),
+
+    /**
+     * Signal number: 12.
+     * User defined signal 2 (POSIX)
+     */
+    SIGUSR2("SIGUSR2"),
+
+    /**
+     * Signal number: 13.
+     * Write on a pipe with no reader, broken pipe (POSIX)
+     */
+    SIGPIPE("SIGPIPE"),
+
+    /**
+     * Signal number: 14.
+     * Alarm clock (POSIX)
+     */
+    SIGALRM("SIGALRM"),
+
+    /**
+     * Signal number: 15.
+     * Termination (ANSI)
+     */
+    SIGTERM("SIGTERM"),
+
+    /**
+     * Signal number: 16.
+     * Stack fault.
+     */
+    SIGSTKFLT("SIGSTKFLT"),
+
+    /**
+     * Signal number: 17.
+     * Child process has stopped or exited, changed (POSIX)
+     */
+    SIGCHLD("SIGCHLD"),
+
+    /**
+     * Signal number: 18.
+     * Continue executing if stopped (POSIX)
+     */
+    SIGCONT("SIGCONT"),
+
+    /**
+     * Signal number: 19.
+     * Stop executing (POSIX)
+     */
+    SIGSTOP("SIGSTOP"),
+
+    /**
+     * Signal number: 20.
+     * Terminal stop signal (POSIX)
+     */
+    SIGTSTP("SIGTSTP"),
+
+    /**
+     * Signal number: 21.
+     * Background process trying to read from TTY
+     */
+    SIGTTIN("SIGTTIN"),
+
+    /**
+     * Signal number: 22.
+     * Background process trying to write to TTY
+     */
+    SIGTTOU("SIGTTOU"),
+
+    /**
+     * Signal number: 23.
+     * Urgen condition on socket (4.2 BSD)
+     */
+    SIGURG("SIGURG"),
+
+    /**
+     * Signal number: 24.
+     * CPU limit exceeded (4.2 BSD)
+     */
+    SIGXCPU("SIGXCPU"),
+
+    /**
+     * Signal number: 25.
+     * File size limit exceeded (4.2 BSD)
+     */
+    SIGXFSZ("SIGXFSZ"),
+
+    /**
+     * Signal number: 26.
+     * Virtual alarm clock (4.2 BSD)
+     */
+    SIGVTALRM("SIGVTALRM"),
+
+    /**
+     * Signal number: 27.
+     * Profiling alarm clock (4.2 BSD)
+     */
+    SIGPROF("SIGPROF"),
+
+    /**
+     * Signal number: 28.
+     * Window size change (4.3 BSD, Sun)
+     */
+    SIGWINCH("SIGWINCH"),
+
+    /**
+     * Signal number: 29.
+     * I/O now possible (4.2 BSD)
+     */
+    SIGIO("SIGIO"),
+
+    /**
+     * Signal number: 30.
+     * Power failure restart (System V)
+     */
+    SIGPWR("SIGPWR");
+
+    private final String name;
+
+    Signal(String name) {
+      this.name = name;
+    }
+
+    public String getName() {
+      return name;
+    }
+  }
 
   /**
    * Remove a docker container.
@@ -1462,14 +1677,138 @@ public interface DockerClient extends Closeable {
 
 
   /**
-   * List all networks.
+   * List all or a subset of the networks.
+   * Filters were added in Docker 1.10, API version 1.22.
    *
    * @return networks
    * @throws DockerException      if a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
    */
-  List<Network> listNetworks() throws DockerException, InterruptedException;
+  List<Network> listNetworks(ListNetworksParam... params)
+      throws DockerException, InterruptedException;
 
+  /**
+   * Parameters for {@link #listNetworks(ListNetworksParam...)}
+   * @since Docker 1.10, API version 1.22
+   */
+  class ListNetworksParam extends Param {
+
+    private ListNetworksParam(final String name, final String value) {
+      super(name, value);
+    }
+    
+    /**
+     * Create a custom filter.
+     * @param name of filter
+     * @param value of filter
+     * @return ListNetworksParam
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam filter(final String name, final String value) {
+      return new ListNetworksFilterParam(name, value);
+    }
+
+    /**
+     * Filter networks by ID.
+     * @param id Matches all or part of a network ID.
+     * @return The ListNetworksParam for the given ID.
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam byNetworkId(final String id) {
+      return filter("id", id);
+    }
+
+    /**
+     * Filter networks by name.
+     * @param name Matches all or part of a network name.
+     * @return The ListNetworksParam for the given name.
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam byNetworkName(final String name) {
+      return filter("name", name);
+    }
+
+    /**
+     * Filter networks by network driver.
+     * @param driver The network driver name.
+     * @return The ListNetworksParam for the given driver.
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withDriver(final String driver) {
+      return filter("driver", driver);
+    }
+
+    /**
+     * Filter networks by network type.
+     * There are two types of networks: those built-in into Docker
+     * and custom networks created by users.
+     * @param type The network type.
+     * @return The ListNetworksParam for the given type.
+     * @see #builtInNetworks()
+     * @see #customNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam withType(final Network.Type type) {
+      return filter("type", type.getName());
+    }
+
+    /**
+     * Return built-in networks only.
+     * @return The ListNetworksParam for built-in networks.
+     * @see #withType(com.spotify.docker.client.messages.Network.Type)
+     * @see #customNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam builtInNetworks() {
+      return withType(BUILTIN);
+    }
+
+    /**
+     * Return user-defined (custom) networks only.
+     * @return The ListNetworksParam for user-defined networks.
+     * @see #withType(com.spotify.docker.client.messages.Network.Type)
+     * @see #builtInNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam customNetworks() {
+      return withType(CUSTOM);
+    }
+
+    /**
+     * Return networks with a label value.
+     * @param label The label to filter on
+     * @param value The value of the label
+     * @return ListNetworksParam
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withLabel(String label, String value) {
+      return isNullOrEmpty(value) ? filter("label", label) : filter("label", label + "=" + value);
+    }
+
+    /**
+     * Return networks with a label.
+     * @param label The label to filter on
+     * @return ListNetworksParam
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withLabel(String label) {
+      return withLabel(label, null);
+    }
+  }
+  
+  /**
+   * Filter parameter for {@link #listNetworks(ListNetworksParam...)}.
+   * This should be used by ListNetworksParam only.
+   * @since Docker 1.10, API version 1.22
+   */
+  class ListNetworksFilterParam extends ListNetworksParam implements FilterParam {
+    
+    private ListNetworksFilterParam(String name, String value) {
+      super(name, value);
+    }
+    
+  }
+  
   /**
    * Inspect a specific network.
    *
@@ -2023,7 +2362,7 @@ public interface DockerClient extends Closeable {
     }
   }
 
-  class ListContainersFilterParam extends ListContainersParam {
+  class ListContainersFilterParam extends ListContainersParam implements FilterParam {
 
     public ListContainersFilterParam(String name, String value) {
       super(name, value);
@@ -2145,7 +2484,7 @@ public interface DockerClient extends Closeable {
    * Filter parameter for {@link #listImages(ListImagesParam...)}. This should be used by
    * ListImagesParam only.
    */
-  class ListImagesFilterParam extends ListImagesParam {
+  class ListImagesFilterParam extends ListImagesParam implements FilterParam {
 
     public ListImagesFilterParam(String name, String value) {
       super(name, value);
@@ -2155,32 +2494,10 @@ public interface DockerClient extends Closeable {
   /**
    * Parameters for {@link #events(EventsParam...)}
    */
-  class EventsParam {
-
-    private final String name;
-    private final String value;
+  class EventsParam extends Param {
 
     private EventsParam(final String name, final String value) {
-      this.name = name;
-      this.value = value;
-    }
-
-    /**
-     * Parameter name.
-     *
-     * @return The name
-     */
-    public String name() {
-      return name;
-    }
-
-    /**
-     * Parameter value.
-     *
-     * @return The value
-     */
-    public String value() {
-      return value;
+      super(name, value);
     }
 
     /**
@@ -2326,7 +2643,7 @@ public interface DockerClient extends Closeable {
   /**
    * Filter parameter for {@link #events(EventsParam...)}. This should be used by EventsParam only.
    */
-  class EventsFilterParam extends EventsParam {
+  class EventsFilterParam extends EventsParam implements FilterParam {
 
     public EventsFilterParam(String name, String value) {
       super(name, value);
@@ -2454,7 +2771,7 @@ public interface DockerClient extends Closeable {
    * ListVolumesParam only.
    * @since Docker 1.9, API version 1.21
    */
-  class ListVolumesFilterParam extends ListVolumesParam {
+  class ListVolumesFilterParam extends ListVolumesParam implements FilterParam {
     public ListVolumesFilterParam(String name, String value) {
       super(name, value);
     }

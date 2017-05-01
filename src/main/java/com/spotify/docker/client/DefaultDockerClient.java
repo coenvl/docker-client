@@ -128,6 +128,7 @@ import java.net.URLEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -149,6 +150,8 @@ import javax.ws.rs.client.Invocation;
 import javax.ws.rs.client.ResponseProcessingException;
 import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.GenericType;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
 import org.apache.commons.compress.utils.IOUtils;
 import org.apache.http.client.config.RequestConfig;
@@ -500,10 +503,25 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     WebTarget resource = resource()
         .path("containers").path("json");
+    resource = addParameters(resource, params);
 
+    try {
+      return request(GET, CONTAINER_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 400:
+          throw new BadParamException(getQueryParamMap(resource), e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  private WebTarget addParameters(WebTarget resource, final Param... params)
+      throws DockerException {
     final Map<String, List<String>> filters = newHashMap();
-    for (final ListContainersParam param : params) {
-      if (param instanceof ListContainersFilterParam) {
+    for (final Param param : params) {
+      if (param instanceof FilterParam) {
         List<String> filterValueList;
         if (filters.containsKey(param.name())) {
           filterValueList = filters.get(param.name());
@@ -523,17 +541,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       // urlEncodeFilters will return null and queryParam() will remove that query parameter.
       resource = resource.queryParam("filters", urlEncodeFilters(filters));
     }
-
-    try {
-      return request(GET, CONTAINER_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
-    } catch (DockerRequestException e) {
-      switch (e.status()) {
-        case 400:
-          throw new BadParamException(getQueryParamMap(resource), e);
-        default:
-          throw e;
-      }
-    }
+    return resource;
   }
 
   private Map<String, String> getQueryParamMap(final WebTarget resource) {
@@ -587,30 +595,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     WebTarget resource = resource()
         .path("images").path("json");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final ListImagesParam param : params) {
-      if (param instanceof ListImagesFilterParam) {
-        final List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
-
+    resource = addParameters(resource, params);
     return request(GET, IMAGE_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
   }
 
@@ -661,9 +646,21 @@ public class DefaultDockerClient implements DockerClient, Closeable {
 
   private void containerAction(final String containerId, final String action)
       throws DockerException, InterruptedException {
+    containerAction(containerId, action, new MultivaluedHashMap<String, String>());
+  }
+
+  private void containerAction(final String containerId, final String action,
+                               final MultivaluedMap<String, String> queryParameters)
+          throws DockerException, InterruptedException {
     try {
       final WebTarget resource = resource()
-          .path("containers").path(containerId).path(action);
+              .path("containers").path(containerId).path(action);
+
+      for (Map.Entry<String, List<String>> queryParameter : queryParameters.entrySet()) {
+        for (String parameterValue : queryParameter.getValue()) {
+          resource.queryParam(queryParameter.getKey(), parameterValue);
+        }
+      }
       request(POST, resource, resource.request());
     } catch (DockerRequestException e) {
       switch (e.status()) {
@@ -699,25 +696,28 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     checkNotNull(containerId, "containerId");
     checkNotNull(secondsToWaitBeforeRestart, "secondsToWait");
-    try {
-      final WebTarget resource = resource().path("containers").path(containerId)
-          .path("restart")
-          .queryParam("t", String.valueOf(secondsToWaitBeforeRestart));
-      request(POST, resource, resource.request());
-    } catch (DockerRequestException e) {
-      switch (e.status()) {
-        case 404:
-          throw new ContainerNotFoundException(containerId, e);
-        default:
-          throw e;
-      }
-    }
-  }
 
+    MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+    queryParameters.add("t", String.valueOf(secondsToWaitBeforeRestart));
+
+    containerAction(containerId, "restart", queryParameters);
+  }
 
   @Override
   public void killContainer(final String containerId) throws DockerException, InterruptedException {
+    checkNotNull(containerId, "containerId");
     containerAction(containerId, "kill");
+  }
+
+  @Override
+  public void killContainer(final String containerId, final Signal signal)
+      throws DockerException, InterruptedException {
+    checkNotNull(containerId, "containerId");
+
+    MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+    queryParameters.add("signal", signal.getName());
+
+    containerAction(containerId, "kill", queryParameters);
   }
 
   @Override
@@ -1506,29 +1506,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   public EventStream events(EventsParam... params)
       throws DockerException, InterruptedException {
     WebTarget resource = noTimeoutResource().path("events");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final EventsParam param : params) {
-      if (param instanceof EventsFilterParam) {
-        final List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
+    resource = addParameters(resource, params);
 
     try {
       final CloseableHttpClient client = (CloseableHttpClient) ApacheConnectorProvider
@@ -1951,11 +1929,13 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   }
 
   @Override
-  public List<Network> listNetworks() throws DockerException, InterruptedException {
-    final WebTarget resource = resource().path("networks");
+  public List<Network> listNetworks(final ListNetworksParam... params)
+      throws DockerException, InterruptedException {
+    WebTarget resource = resource().path("networks");
+    resource = addParameters(resource, params);
     return request(GET, NETWORK_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
   }
-
+  
   @Override
   public Network inspectNetwork(String networkId) throws DockerException, InterruptedException {
     final WebTarget resource = resource().path("networks").path(networkId);
@@ -2116,30 +2096,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   public VolumeList listVolumes(ListVolumesParam... params)
       throws DockerException, InterruptedException {
     WebTarget resource = resource().path("volumes");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final ListVolumesParam param : params) {
-      if (param instanceof ListVolumesFilterParam) {
-        List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
-
+    resource = addParameters(resource, params);
     return request(GET, VolumeList.class, resource, resource.request(APPLICATION_JSON_TYPE));
   }
 
