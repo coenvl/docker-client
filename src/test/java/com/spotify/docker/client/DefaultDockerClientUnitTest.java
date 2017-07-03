@@ -20,93 +20,107 @@
 
 package com.spotify.docker.client;
 
-import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
+import static com.spotify.docker.FixtureUtil.fixture;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.Assert.assertThat;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.google.common.base.Supplier;
-import com.google.common.base.Suppliers;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.util.concurrent.Futures;
+import com.google.common.io.BaseEncoding;
+import com.google.common.io.Resources;
+import com.spotify.docker.client.auth.RegistryAuthSupplier;
+import com.spotify.docker.client.exceptions.DockerCertificateException;
+import com.spotify.docker.client.exceptions.DockerException;
+import com.spotify.docker.client.exceptions.NodeNotFoundException;
+import com.spotify.docker.client.exceptions.NonSwarmNodeException;
 import com.spotify.docker.client.messages.ContainerConfig;
-import com.spotify.docker.client.messages.ContainerCreation;
 import com.spotify.docker.client.messages.HostConfig;
-import com.spotify.docker.client.messages.Info;
-
-import java.net.URI;
-import java.util.Map;
-import java.util.concurrent.Future;
-
-import javax.ws.rs.client.AsyncInvoker;
-import javax.ws.rs.client.Client;
-import javax.ws.rs.client.ClientBuilder;
-import javax.ws.rs.client.Entity;
-import javax.ws.rs.client.Invocation;
-import javax.ws.rs.client.WebTarget;
-import javax.ws.rs.core.Configuration;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.Variant;
-
-import org.junit.Assert;
+import com.spotify.docker.client.messages.RegistryAuth;
+import com.spotify.docker.client.messages.RegistryConfigs;
+import com.spotify.docker.client.messages.ServiceCreateResponse;
+import com.spotify.docker.client.messages.swarm.ContainerSpec;
+import com.spotify.docker.client.messages.swarm.EngineConfig;
+import com.spotify.docker.client.messages.swarm.Node;
+import com.spotify.docker.client.messages.swarm.NodeDescription;
+import com.spotify.docker.client.messages.swarm.NodeInfo;
+import com.spotify.docker.client.messages.swarm.NodeSpec;
+import com.spotify.docker.client.messages.swarm.ServiceSpec;
+import com.spotify.docker.client.messages.swarm.SwarmJoin;
+import com.spotify.docker.client.messages.swarm.TaskSpec;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import okhttp3.mockwebserver.MockResponse;
+import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
+import okio.Buffer;
+import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
-import org.mockito.ArgumentCaptor;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
+import org.junit.rules.ExpectedException;
 
+/**
+ * Tests DefaultDockerClient against a {@link okhttp3.mockwebserver.MockWebServer} instance, so
+ * we can assert what the HTTP requests look like that DefaultDockerClient sends and test how
+ * DefaltDockerClient behaves given certain responses from the Docker Remote API.
+ * <p>
+ * This test may not be a true "unit test", but using a MockWebServer where we can control the HTTP
+ * responses sent by the server and capture the HTTP requests sent by the class-under-test is far
+ * simpler that attempting to mock the {@link javax.ws.rs.client.Client} instance used by
+ * DefaultDockerClient, since the Client has such a rich/fluent interface and many methods/classes
+ * that would need to be mocked. Ultimately for testing DefaultDockerClient all we care about is
+ * the HTTP requests it sends, rather than what HTTP client library it uses.</p>
+ * <p>
+ * When adding new functionality to DefaultDockerClient, please consider and prioritize adding unit
+ * tests to cover the new functionality in this file rather than integration tests that require a
+ * real docker daemon in {@link DefaultDockerClientTest}. While integration tests are valuable,
+ * they are more brittle and harder to run than a simple unit test that captures/asserts HTTP
+ * requests and responses.</p>
+ *
+ * @see <a href="https://github.com/square/okhttp/tree/master/mockwebserver">
+ * https://github.com/square/okhttp/tree/master/mockwebserver</a>
+ */
 public class DefaultDockerClientUnitTest {
 
-  @Mock
-  private Client clientMock;
+  private final MockWebServer server = new MockWebServer();
 
-  @Mock
-  private ClientBuilder clientBuilderMock;
-
-  @Mock
-  private Invocation.Builder builderMock;
-
-  @Mock
-  private AsyncInvoker asyncInvoker;
-
-  @Mock
-  private WebTarget webTargetMock;
-
-  private Supplier<ClientBuilder> clientBuilderSupplier;
   private DefaultDockerClient.Builder builder;
+
+  @Rule
+  public ExpectedException thrown = ExpectedException.none();
 
   @Before
   public void setup() throws Exception {
-    MockitoAnnotations.initMocks(this);
-
-    when(clientBuilderMock.build()).thenReturn(clientMock);
-    when(clientBuilderMock.withConfig(any(Configuration.class))).thenReturn(clientBuilderMock);
-    when(clientBuilderMock.property(anyString(), any())).thenReturn(clientBuilderMock);
-
-    clientBuilderSupplier = Suppliers.ofInstance(clientBuilderMock);
-
-    when(clientMock.target(any(URI.class))).thenReturn(webTargetMock);
-    // return the same mock for any path.
-    when(webTargetMock.path(anyString())).thenReturn(webTargetMock);
-
-    when(webTargetMock.request(MediaType.APPLICATION_JSON_TYPE)).thenReturn(builderMock);
-
-    when(builderMock.async()).thenReturn(asyncInvoker);
-
-    final Future<Info> futureMock = Futures.immediateFuture(mock(Info.class));
-    when(asyncInvoker.method(anyString(), any(Class.class))).thenReturn(futureMock);
+    server.start();
 
     builder = DefaultDockerClient.builder();
-    builder.uri("https://perdu.com:2375");
+    builder.uri(server.url("/").uri());
+  }
+
+  @After
+  public void tearDown() throws Exception {
+    server.shutdown();
   }
 
   @Test
@@ -137,62 +151,52 @@ public class DefaultDockerClientUnitTest {
     assertThat(client.getHost(), equalTo("192.168.53.103"));
   }
 
-  @Test
-  public void testNoHeaders() throws Exception {
-    final DefaultDockerClient dockerClient = new DefaultDockerClient(
-        builder, clientBuilderSupplier);
-    dockerClient.info();
-
-    verify(builderMock, never()).header(anyString(), anyString());
+  private RecordedRequest takeRequestImmediately() throws InterruptedException {
+    return server.takeRequest(1, TimeUnit.MILLISECONDS);
   }
 
   @Test
-  public void testOneHeader() throws Exception {
-    builder.header("foo", 1);
+  public void testCustomHeaders() throws Exception {
+    builder.header("int", 1);
+    builder.header("string", "2");
+    builder.header("list", Lists.newArrayList("a", "b", "c"));
 
-    final DefaultDockerClient dockerClient = new DefaultDockerClient(
-        builder, clientBuilderSupplier);
+    server.enqueue(new MockResponse());
+
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
     dockerClient.info();
 
-    final ArgumentCaptor<String> keyArgument = ArgumentCaptor.forClass(String.class);
-    final ArgumentCaptor<Object> valueArgument = ArgumentCaptor.forClass(Object.class);
-    verify(builderMock, times(1)).header(keyArgument.capture(), valueArgument.capture());
+    final RecordedRequest recordedRequest = takeRequestImmediately();
+    assertThat(recordedRequest.getMethod(), is("GET"));
+    assertThat(recordedRequest.getPath(), is("/info"));
 
-    Assert.assertEquals("foo", keyArgument.getValue());
-    Assert.assertEquals(1, valueArgument.getValue());
+    assertThat(recordedRequest.getHeader("int"), is("1"));
+    assertThat(recordedRequest.getHeader("string"), is("2"));
+    // TODO (mbrown): this seems like incorrect behavior - the client should send 3 headers with
+    // name "list", not one header with a value of "[a, b, c]"
+    assertThat(recordedRequest.getHeaders().values("list"), contains("[a, b, c]"));
+  }
+
+  private static JsonNode toJson(Buffer buffer) throws IOException {
+    return ObjectMapperProvider.objectMapper().readTree(buffer.inputStream());
+  }
+
+  private static JsonNode toJson(byte[] bytes) throws IOException {
+    return ObjectMapperProvider.objectMapper().readTree(bytes);
+  }
+
+  private static JsonNode toJson(Object object) throws IOException {
+    return ObjectMapperProvider.objectMapper().valueToTree(object);
+  }
+
+  private static ObjectNode createObjectNode() {
+    return ObjectMapperProvider.objectMapper().createObjectNode();
   }
 
   @Test
-  public void testMultipleHeaders() throws Exception {
-    final Map<String, Object> headers = Maps.newHashMap();
-    headers.put("int", 1);
-    headers.put("string", "2");
-    headers.put("list", Lists.newArrayList("a", "b", "c"));
-
-    for (final Map.Entry<String, Object> entry : headers.entrySet()) {
-      builder.header(entry.getKey(), entry.getValue());
-    }
-
-    final DefaultDockerClient dockerClient = new DefaultDockerClient(
-        builder, clientBuilderSupplier);
-    dockerClient.info();
-
-    final ArgumentCaptor<String> nameCaptor = ArgumentCaptor.forClass(String.class);
-    final ArgumentCaptor<String> valueCaptor = ArgumentCaptor.forClass(String.class);
-    verify(builderMock, times(headers.size())).header(nameCaptor.capture(), valueCaptor.capture());
-
-    int idx = 0;
-    for (final Map.Entry<String, Object> entry : headers.entrySet()) {
-      Assert.assertEquals(entry.getKey(), nameCaptor.getAllValues().get(idx));
-      Assert.assertEquals(entry.getValue(), valueCaptor.getAllValues().get(idx));
-      ++idx;
-    }
-  }
-
-  @Test
+  @SuppressWarnings("unchecked")
   public void testCapAddAndDrop() throws Exception {
-    final DefaultDockerClient dockerClient = new DefaultDockerClient(
-        builder, clientBuilderSupplier);
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
 
     final HostConfig hostConfig = HostConfig.builder()
         .capAdd(ImmutableList.of("foo", "bar"))
@@ -203,27 +207,487 @@ public class DefaultDockerClientUnitTest {
         .hostConfig(hostConfig)
         .build();
 
-    //noinspection unchecked
-    when(asyncInvoker.method(
-        anyString(), any(Entity.class), any(Class.class)))
-        .thenReturn(Futures.immediateFuture(ContainerCreation.builder().build()));
+    server.enqueue(new MockResponse());
 
     dockerClient.createContainer(containerConfig);
 
-    final ArgumentCaptor<String> methodArg = ArgumentCaptor.forClass(String.class);
-    final ArgumentCaptor<Entity> entityArg = ArgumentCaptor.forClass(Entity.class);
-    final ArgumentCaptor<Class> classArg = ArgumentCaptor.forClass(Class.class);
+    final RecordedRequest recordedRequest = takeRequestImmediately();
 
-    //noinspection unchecked
-    verify(asyncInvoker, times(1)).method(
-        methodArg.capture(), entityArg.capture(), classArg.capture());
+    assertThat(recordedRequest.getMethod(), is("POST"));
+    assertThat(recordedRequest.getPath(), is("/containers/create"));
 
-    final Entity expectedEntity = Entity.entity(
-        containerConfig, new Variant(MediaType.valueOf(APPLICATION_JSON), (String) null, null));
+    assertThat(recordedRequest.getHeader("Content-Type"), is("application/json"));
 
-    // Check that we've called the right method on the underlying AsyncInvoker with the right params
-    assertThat(methodArg.getValue(), equalTo("POST"));
-    assertThat(entityArg.getValue(), equalTo(expectedEntity));
-    assertThat(classArg.getValue(), instanceOf(Class.class));
+    // TODO (mbrown): use hamcrest-jackson for this, once we upgrade to Java 8
+    final JsonNode requestJson = toJson(recordedRequest.getBody());
+
+    final JsonNode capAddNode = requestJson.get("HostConfig").get("CapAdd");
+    assertThat(capAddNode.isArray(), is(true));
+
+    assertThat(childrenTextNodes((ArrayNode) capAddNode), containsInAnyOrder("baz", "qux"));
+  }
+
+  private static Set<String> childrenTextNodes(ArrayNode arrayNode) {
+    final Set<String> texts = new HashSet<>();
+    for (JsonNode child : arrayNode) {
+      Preconditions.checkState(child.isTextual(),
+          "ArrayNode must only contain text nodes, but found %s in %s",
+          child.getNodeType(),
+          arrayNode);
+      texts.add(child.textValue());
+    }
+    return texts;
+  }
+
+  @Test
+  @SuppressWarnings("deprecated")
+  public void buildThrowsIfRegistryAuthandRegistryAuthSupplierAreBothSpecified()
+      throws DockerCertificateException {
+    thrown.expect(IllegalStateException.class);
+    thrown.expectMessage("LOGIC ERROR");
+
+    final RegistryAuthSupplier authSupplier = mock(RegistryAuthSupplier.class);
+
+    //noinspection deprecation
+    DefaultDockerClient.builder()
+        .registryAuth(RegistryAuth.builder().identityToken("hello").build())
+        .registryAuthSupplier(authSupplier)
+        .build();
+  }
+
+  @Test
+  public void testBuildPassesMultipleRegistryConfigs() throws Exception {
+    final RegistryConfigs registryConfigs = RegistryConfigs.create(ImmutableMap.of(
+        "server1", RegistryAuth.builder()
+            .serverAddress("server1")
+            .username("u1")
+            .password("p1")
+            .email("e1")
+            .build(),
+
+        "server2", RegistryAuth.builder()
+            .serverAddress("server2")
+            .username("u2")
+            .password("p2")
+            .email("e2")
+            .build()
+    ));
+
+    final RegistryAuthSupplier authSupplier = mock(RegistryAuthSupplier.class);
+    when(authSupplier.authForBuild()).thenReturn(registryConfigs);
+
+    final DefaultDockerClient client = builder.registryAuthSupplier(authSupplier)
+        .build();
+
+    // build() calls /version to check what format of header to send
+    enqueueServerApiVersion("1.20");
+
+    // TODO (mbrown): what to return for build response?
+    server.enqueue(new MockResponse()
+        .setResponseCode(200)
+    );
+
+    final Path path = Paths.get(Resources.getResource("dockerDirectory").toURI());
+
+    client.build(path);
+
+    final RecordedRequest versionRequest = takeRequestImmediately();
+    assertThat(versionRequest.getMethod(), is("GET"));
+    assertThat(versionRequest.getPath(), is("/version"));
+
+    final RecordedRequest buildRequest = takeRequestImmediately();
+    assertThat(buildRequest.getMethod(), is("POST"));
+    assertThat(buildRequest.getPath(), is("/build"));
+
+    final String registryConfigHeader = buildRequest.getHeader("X-Registry-Config");
+    assertThat(registryConfigHeader, is(not(nullValue())));
+
+    // check that the JSON in the header is equivalent to what we mocked out above from
+    // the registryAuthSupplier
+    final JsonNode headerJsonNode = toJson(BaseEncoding.base64().decode(registryConfigHeader));
+    assertThat(headerJsonNode, is(toJson(registryConfigs.configs())));
+  }
+
+  @Test
+  public void testNanoCpus() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    final HostConfig hostConfig = HostConfig.builder()
+        .nanoCpus(2_000_000_000L)
+        .build();
+
+    final ContainerConfig containerConfig = ContainerConfig.builder()
+        .hostConfig(hostConfig)
+        .build();
+
+    server.enqueue(new MockResponse());
+
+    dockerClient.createContainer(containerConfig);
+
+    final RecordedRequest recordedRequest = takeRequestImmediately();
+
+    final JsonNode requestJson = toJson(recordedRequest.getBody());
+    final JsonNode nanoCpus = requestJson.get("HostConfig").get("NanoCpus");
+
+    assertThat(hostConfig.nanoCpus(), is(nanoCpus.longValue()));
+  }
+
+  @Test
+  public void testInspectNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    // build() calls /version to check what format of header to send
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiResponse(200, "fixtures/1.28/nodeInfo.json");
+
+    final NodeInfo nodeInfo = dockerClient.inspectNode("24ifsmvkjbyhk");
+
+    assertThat(nodeInfo, notNullValue());
+    assertThat(nodeInfo.id(), is("24ifsmvkjbyhk"));
+    assertThat(nodeInfo.status(), notNullValue());
+    assertThat(nodeInfo.status().addr(), is("172.17.0.2"));
+    assertThat(nodeInfo.managerStatus(), notNullValue());
+    assertThat(nodeInfo.managerStatus().addr(), is("172.17.0.2:2377"));
+    assertThat(nodeInfo.managerStatus().leader(), is(true));
+    assertThat(nodeInfo.managerStatus().reachability(), is("reachable"));
+  }
+
+  @Test
+  public void testInspectNonLeaderNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.27");
+
+    server.enqueue(new MockResponse()
+        .setResponseCode(200)
+        .addHeader("Content-Type", "application/json")
+        .setBody(
+            fixture("fixtures/1.27/nodeInfoNonLeader.json")
+        )
+    );
+
+    NodeInfo nodeInfo = dockerClient.inspectNode("24ifsmvkjbyhk");
+    assertThat(nodeInfo, notNullValue());
+    assertThat(nodeInfo.id(), is("24ifsmvkjbyhk"));
+    assertThat(nodeInfo.status(), notNullValue());
+    assertThat(nodeInfo.status().addr(), is("172.17.0.2"));
+    assertThat(nodeInfo.managerStatus(), notNullValue());
+    assertThat(nodeInfo.managerStatus().addr(), is("172.17.0.2:2377"));
+    assertThat(nodeInfo.managerStatus().leader(), nullValue());
+    assertThat(nodeInfo.managerStatus().reachability(), is("reachable"));
+  }
+
+  @Test
+  public void testInspectNodeNonManager() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.27");
+
+    server.enqueue(new MockResponse()
+        .setResponseCode(200)
+        .addHeader("Content-Type", "application/json")
+        .setBody(
+            fixture("fixtures/1.27/nodeInfoNonManager.json")
+        )
+    );
+
+    NodeInfo nodeInfo = dockerClient.inspectNode("24ifsmvkjbyhk");
+    assertThat(nodeInfo, notNullValue());
+    assertThat(nodeInfo.id(), is("24ifsmvkjbyhk"));
+    assertThat(nodeInfo.status(), notNullValue());
+    assertThat(nodeInfo.status().addr(), is("172.17.0.2"));
+    assertThat(nodeInfo.managerStatus(), nullValue());
+  }
+
+  @Test(expected = NodeNotFoundException.class)
+  public void testInspectMissingNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    // build() calls /version to check what format of header to send
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiEmptyResponse(404);
+
+    dockerClient.inspectNode("24ifsmvkjbyhk");
+  }
+
+  @Test(expected = NonSwarmNodeException.class)
+  public void testInspectNonSwarmNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    // build() calls /version to check what format of header to send
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiEmptyResponse(503);
+
+    dockerClient.inspectNode("24ifsmvkjbyhk");
+  }
+
+  @Test
+  public void testUpdateNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiResponse(200, "fixtures/1.28/listNodes.json");
+
+    final List<Node> nodes = dockerClient.listNodes();
+
+    assertThat(nodes.size(), is(1));
+
+    final Node node = nodes.get(0);
+
+    assertThat(node.id(), equalTo("24ifsmvkjbyhk"));
+    assertThat(node.version().index(), equalTo(8L));
+    assertThat(node.spec().name(), equalTo("my-node"));
+    assertThat(node.spec().role(), equalTo("manager"));
+    assertThat(node.spec().availability(), equalTo("active"));
+    assertThat(node.spec().labels(), hasKey(equalTo("foo")));
+
+    final NodeSpec updatedNodeSpec = NodeSpec.builder(node.spec())
+        .addLabel("foobar", "foobar")
+        .build();
+
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiEmptyResponse(200);
+
+    dockerClient.updateNode(node.id(), node.version().index(), updatedNodeSpec);
+  }
+
+  @Test(expected = DockerException.class)
+  public void testUpdateNodeWithInvalidVersion() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+
+    final ObjectNode errorMessage = createObjectNode()
+        .put("message", "invalid node version: '7'");
+
+    enqueueServerApiResponse(500, errorMessage);
+
+    final NodeSpec nodeSpec = NodeSpec.builder()
+        .addLabel("foo", "baz")
+        .name("foobar")
+        .availability("active")
+        .role("manager")
+        .build();
+
+    dockerClient.updateNode("24ifsmvkjbyhk", 7L, nodeSpec);
+  }
+
+  @Test(expected = NodeNotFoundException.class)
+  public void testUpdateMissingNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiError(404, "Error updating node: '24ifsmvkjbyhk'");
+
+    final NodeSpec nodeSpec = NodeSpec.builder()
+        .addLabel("foo", "baz")
+        .name("foobar")
+        .availability("active")
+        .role("manager")
+        .build();
+
+    dockerClient.updateNode("24ifsmvkjbyhk", 8L, nodeSpec);
+  }
+
+  @Test(expected = NonSwarmNodeException.class)
+  public void testUpdateNonSwarmNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+    enqueueServerApiError(503, "Error updating node: '24ifsmvkjbyhk'");
+
+    final NodeSpec nodeSpec = NodeSpec.builder()
+        .name("foobar")
+        .addLabel("foo", "baz")
+        .availability("active")
+        .role("manager")
+        .build();
+
+    dockerClient.updateNode("24ifsmvkjbyhk", 8L, nodeSpec);
+  }
+
+  @Test
+  public void testJoinSwarm() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.24");
+    enqueueServerApiEmptyResponse(200);
+
+    SwarmJoin swarmJoin = SwarmJoin.builder()
+            .joinToken("token_foo")
+            .listenAddr("0.0.0.0:2377")
+            .remoteAddrs(Arrays.asList("10.0.0.10:2377"))
+            .build();
+
+    dockerClient.joinSwarm(swarmJoin);
+  }
+
+  private void enqueueServerApiError(final int statusCode, final String message)
+      throws IOException {
+    final ObjectNode errorMessage = createObjectNode()
+        .put("message", message);
+
+    enqueueServerApiResponse(statusCode, errorMessage);
+  }
+
+  @Test
+  public void testDeleteNode() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.24");
+    enqueueServerApiEmptyResponse(200);
+
+    dockerClient.deleteNode("node-1234");
+  }
+
+  @Test(expected = NodeNotFoundException.class)
+  public void testDeleteNode_NodeNotFound() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.24");
+    enqueueServerApiEmptyResponse(404);
+
+    dockerClient.deleteNode("node-1234");
+  }
+
+  @Test(expected = NonSwarmNodeException.class)
+  public void testDeleteNode_NodeNotPartOfSwarm() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.24");
+    enqueueServerApiEmptyResponse(503);
+
+    dockerClient.deleteNode("node-1234");
+  }
+
+  @Test
+  public void testCreateServiceWithWarnings() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    // build() calls /version to check what format of header to send
+    enqueueServerApiVersion("1.25");
+    enqueueServerApiResponse(201, "fixtures/1.25/createServiceResponse.json");
+
+    final TaskSpec taskSpec = TaskSpec.builder()
+        .containerSpec(ContainerSpec.builder()
+            .image("this_image_is_not_found_in_the_registry")
+            .build())
+        .build();
+
+    final ServiceSpec spec = ServiceSpec.builder()
+        .name("test")
+        .taskTemplate(taskSpec)
+        .build();
+
+    final ServiceCreateResponse response = dockerClient.createService(spec);
+    assertThat(response.id(), is(notNullValue()));
+    assertThat(response.warnings(), is(hasSize(1)));
+    assertThat(response.warnings(),
+        contains("unable to pin image this_image_is_not_found_in_the_registry to digest"));
+  }
+
+  private void enqueueServerApiEmptyResponse(final int statusCode) {
+    server.enqueue(new MockResponse()
+        .setResponseCode(statusCode)
+        .addHeader("Content-Type", "application/json")
+    );
+  }
+
+  @Test
+  public void testListNodes() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+
+    server.enqueue(new MockResponse()
+        .setResponseCode(200)
+        .addHeader("Content-Type", "application/json")
+        .setBody(
+            fixture("fixtures/1.28/listNodes.json")
+        )
+    );
+
+    final List<Node> nodes = dockerClient.listNodes();
+    assertThat(nodes.size(), equalTo(1));
+
+    final Node node = nodes.get(0);
+
+    assertThat(node, notNullValue());
+    assertThat(node.id(), is("24ifsmvkjbyhk"));
+    assertThat(node.version().index(), is(8L));
+
+    final NodeSpec nodeSpec = node.spec();
+    assertThat(nodeSpec.name(), is("my-node"));
+    assertThat(nodeSpec.role(), is("manager"));
+    assertThat(nodeSpec.availability(), is("active"));
+    assertThat(nodeSpec.labels().keySet(), contains("foo"));
+
+    final NodeDescription desc = node.description();
+    assertThat(desc.hostname(), is("bf3067039e47"));
+    assertThat(desc.platform().architecture(), is("x86_64"));
+    assertThat(desc.platform().os(), is("linux"));
+    assertThat(desc.resources().memoryBytes(), is(8272408576L));
+    assertThat(desc.resources().nanoCpus(), is(4000000000L));
+
+    final EngineConfig engine = desc.engine();
+    assertThat(engine.engineVersion(), is("17.04.0"));
+    assertThat(engine.labels().keySet(), contains("foo"));
+    assertThat(engine.plugins().size(), equalTo(4));
+
+    assertThat(node.status(), notNullValue());
+    assertThat(node.status().addr(), is("172.17.0.2"));
+    assertThat(node.managerStatus(), notNullValue());
+    assertThat(node.managerStatus().addr(), is("172.17.0.2:2377"));
+    assertThat(node.managerStatus().leader(), is(true));
+    assertThat(node.managerStatus().reachability(), is("reachable"));
+  }
+
+  @Test(expected = DockerException.class)
+  public void testListNodesWithServerError() throws Exception {
+    final DefaultDockerClient dockerClient = new DefaultDockerClient(builder);
+
+    enqueueServerApiVersion("1.28");
+
+    server.enqueue(new MockResponse()
+        .setResponseCode(500)
+        .addHeader("Content-Type", "application/json")
+    );
+
+    dockerClient.listNodes();
+  }
+
+  private void enqueueServerApiResponse(final int statusCode, final String fileName)
+      throws IOException {
+    server.enqueue(new MockResponse()
+        .setResponseCode(statusCode)
+        .addHeader("Content-Type", "application/json")
+        .setBody(
+            fixture(fileName)
+        )
+    );
+  }
+
+  private void enqueueServerApiResponse(final int statusCode, final ObjectNode objectResponse)
+      throws IOException {
+    server.enqueue(new MockResponse()
+        .setResponseCode(statusCode)
+        .addHeader("Content-Type", "application/json")
+        .setBody(
+            objectResponse.toString()
+        )
+    );
+  }
+
+  private void enqueueServerApiVersion(final String apiVersion) throws IOException {
+    enqueueServerApiResponse(200,
+        createObjectNode()
+            .put("ApiVersion", apiVersion)
+            .put("Arch", "foobar")
+            .put("GitCommit", "foobar")
+            .put("GoVersion", "foobar")
+            .put("KernelVersion", "foobar")
+            .put("Os", "foobar")
+            .put("Version", "1.20")
+    );
   }
 }

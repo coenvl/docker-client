@@ -22,6 +22,10 @@ case "$1" in
     # Remove old docker files that might prevent the installation and starting of other versions
     sudo rm -fr /var/lib/docker || :
 
+    # As instructed on http://docs.master.dockerproject.org/engine/installation/linux/ubuntulinux/
+    sudo apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 58118E89F3A912897C070ADBF76221572C52609D
+    sudo sh -c "echo deb https://apt.dockerproject.org/repo ubuntu-trusty main > /etc/apt/sources.list.d/docker.list"
+
     if [[ "$RC" == "true" ]]; then
         dist_version="$(lsb_release --codename | cut -f2)"
         sudo sh -c "echo deb [arch=$(dpkg --print-architecture)] https://apt.dockerproject.org/repo ubuntu-${dist_version} testing >> /etc/apt/sources.list.d/docker.list"
@@ -43,6 +47,8 @@ case "$1" in
     # restart the service for the /etc/default/docker change we made after
     # installing the package
     sudo restart docker
+    # Give it time to be ready
+    sleep 10
 
     if [[ "$ENABLE_SWARM" = "1"  ]]; then
         # initialize docker swarm to be able to run docker tests

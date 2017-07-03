@@ -6,6 +6,7 @@ This user manual is made to correspond to Docker's [API docs][1] (e.g. [API 1.18
   * [Unix socket support](#unix-socket-support)
   * [HTTPS support](#https-support)
   * [Connection pooling](#connection-pooling)
+* [Authentication to private registries](#authentication-to-private-registries)
 * [Containers](#containers)
   * [List containers](#list-containers)
   * [Create a container](#create-a-container)
@@ -56,7 +57,7 @@ This user manual is made to correspond to Docker's [API docs][1] (e.g. [API 1.18
   * [Exec Resize](#exec-resize)
   * [Exec Inspect](#exec-inspect)
   * [Mounting volumes in a container](#mounting-volumes-in-a-container)
-
+* [Troubleshooting](#troubleshooting)
 
 ## Creating a docker-client
 
@@ -114,6 +115,35 @@ Note that the connect timeout is also applied to acquiring a connection from the
 is exhausted and it takes too long to acquire a new connection for a request, we throw a
 `DockerTimeoutException` instead of just waiting forever on a connection becoming available.
 
+## Authentication to private registries
+
+Authentication info when building, pushing, or pulling images, or when using
+Swarm, is provided by a `RegistryAuthSupplier` class.
+
+Docker-client is packaged with a few implementations of this interface
+
+- `auth.ConfigFileRegistryAuthSupplier`, which reads authentication info from
+  the the config files used by docker-cli (`~/.dockercfg` or
+  `~/.docker/config.json`)
+- `auth.NoOpRegistryAuthSupplier` which uses a fixed instance of the
+  `RegistryAuth` and `RegistryConfigs` POJOs
+- `auth.gcr.ContainerRegistryAuthSupplier`, which programmatically fetches
+  access tokens for use with Google Container Registry based on given Gogole
+  Cloud account credentials
+- `auth.MultiRegistryAuthSupplier`, which can be used to combine multiple other
+  implementations
+
+Users are encouraged to implement the `RegistryAuthSupplier` interface
+themselves to support custom authentication logic, and we would be happy to
+review and accept pull requests to add support in the library for additional
+schemes.
+
+Since version 8.7.0, docker-client will automatically enable the
+`ConfigFileRegistryAuthSupplier` class in `DefaultDockerClient` as long as none
+of the other authentication-related methods in the
+`DefaultDockerClient.Builder` class (`dockerAuth(boolean)`,
+`registryAuth(RegistryAuth)`, or `registryAuthSupplier(RegistryAuthSupplier)`)
+are used.
 
 ## Containers
 
@@ -633,3 +663,17 @@ As such, the `ContainerInfo.volumes()` method is deprecated. Instead, use
 
   [1]: https://docs.docker.com/engine/reference/api/docker_remote_api/
   [2]: https://docs.docker.com/engine/reference/api/docker_remote_api_v1.18/
+  
+# Troubleshooting
+
+## HTTP 500 errors returned from the Docker Remote API
+
+docker-client communicates with your local Docker daemon using the HTTP Remote 
+API and any unexpected errors that the daemon encounters will be reported as a
+500 Internal Server Error, which bubbles up from docker-client as an exception 
+like:
+
+> Caused by: com.spotify.docker.client.shaded.javax.ws.rs.InternalServerErrorException: HTTP 500 Internal Server Error
+
+Check the Docker daemon log (typically at `/var/log/docker.log` or 
+`/var/log/upstart/docker.log`) for more details as to the root cause.

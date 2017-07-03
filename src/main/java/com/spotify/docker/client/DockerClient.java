@@ -33,6 +33,8 @@ import com.spotify.docker.client.exceptions.DockerException;
 import com.spotify.docker.client.exceptions.ExecNotFoundException;
 import com.spotify.docker.client.exceptions.ImageNotFoundException;
 import com.spotify.docker.client.exceptions.NetworkNotFoundException;
+import com.spotify.docker.client.exceptions.NodeNotFoundException;
+import com.spotify.docker.client.exceptions.NonSwarmNodeException;
 import com.spotify.docker.client.exceptions.NotFoundException;
 import com.spotify.docker.client.exceptions.PermissionException;
 import com.spotify.docker.client.exceptions.UnsupportedApiVersionException;
@@ -65,13 +67,19 @@ import com.spotify.docker.client.messages.Version;
 import com.spotify.docker.client.messages.Volume;
 import com.spotify.docker.client.messages.VolumeList;
 import com.spotify.docker.client.messages.swarm.Node;
+import com.spotify.docker.client.messages.swarm.NodeInfo;
+import com.spotify.docker.client.messages.swarm.NodeSpec;
 import com.spotify.docker.client.messages.swarm.Secret;
 import com.spotify.docker.client.messages.swarm.SecretCreateResponse;
 import com.spotify.docker.client.messages.swarm.SecretSpec;
 import com.spotify.docker.client.messages.swarm.Service;
 import com.spotify.docker.client.messages.swarm.ServiceSpec;
 import com.spotify.docker.client.messages.swarm.Swarm;
+import com.spotify.docker.client.messages.swarm.SwarmInit;
+import com.spotify.docker.client.messages.swarm.SwarmJoin;
+import com.spotify.docker.client.messages.swarm.SwarmSpec;
 import com.spotify.docker.client.messages.swarm.Task;
+import com.spotify.docker.client.messages.swarm.UnlockKey;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -283,47 +291,6 @@ public interface DockerClient extends Closeable {
   void load(String image, InputStream imagePayload, ProgressHandler handler)
       throws DockerException, InterruptedException;
 
-
-  /**
-   * Creates a single image from a tarball. This method also tags the image
-   * with the given image name upon loading completion.
-   *
-   * @param image        the name to assign to the image.
-   * @param imagePayload the image's payload (i.e.: the stream corresponding to the image's .tar
-   *                     file).
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated Use {@link #load(InputStream)} to load a set of image layers from a tarball. Use
-   * {@link #create(String, InputStream)} to create a single image from the contents of a tarball.
-   */
-  @Deprecated
-  void load(String image, InputStream imagePayload, RegistryAuth registryAuth)
-      throws DockerException, InterruptedException;
-
-
-  /**
-   * Creates a single image from a tarball. This method also tags the image
-   * with the given image name upon loading completion.
-   *
-   * @param image        the name to assign to the image.
-   * @param imagePayload the image's payload (i.e.: the stream corresponding to the image's .tar
-   *                     file).
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @param handler      The handler to use for processing each progress message received from
-   *                     Docker.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated Use {@link #load(InputStream)} to load a set of image layers from a tarball. Use
-   *             {@link #create(String, InputStream, ProgressHandler)} to create a single image from
-   *             the contents of a tarball.
-   */
-  @Deprecated
-  void load(String image, InputStream imagePayload, RegistryAuth registryAuth,
-            ProgressHandler handler) throws DockerException, InterruptedException;
-
   /**
    * Load a set of images and tags from a tarball.
    *
@@ -391,26 +358,6 @@ public interface DockerClient extends Closeable {
    * @throws InterruptedException if the thread is interrupted.
    */
   InputStream save(String... images) throws DockerException, IOException, InterruptedException;
-
-  /**
-   * Get a tarball containing all images and metadata for the repository specified.
-   * @param image the name or id of the image to save. If a specific name and tag
-   *              (e.g. ubuntu:latest), then only that image (and its parents) are returned.
-   *              If an image ID, similarly only that image (and its parents) are returned,
-   *              but with the exclusion of the 'repositories' file in the tarball,
-   *              as there were no image names referenced.
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @return the image's .tar stream.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws IOException          if the server started returning, but an I/O error occurred in the
-   *                              context of processing it on the client-side.
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated RegistryAuth is not required. Use {@link #save(String...)}.
-   */
-  @Deprecated
-  InputStream save(String image, RegistryAuth registryAuth)
-      throws DockerException, IOException, InterruptedException;
 
   /**
    * Get a tarball containing all images and metadata for one or more repositories.
@@ -1482,13 +1429,128 @@ public interface DockerClient extends Closeable {
       throws DockerException, InterruptedException;
 
   /**
-   * Inspect the Swarm cluster. Only available in Docker API &gt;= 1.24.
+   * Inspect the swarm. Only available in Docker API &gt;= 1.24.
    *
    * @return Info about a swarm
-   * @throws DockerException      if a server error occurred (500)
+   * @throws DockerException      If a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
    */
   Swarm inspectSwarm() throws DockerException, InterruptedException;
+
+  /**
+   * Initialize a new swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @return Node ID
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  String initSwarm(SwarmInit swarmInit) throws DockerException, InterruptedException;
+
+  /**
+   * Join an existing swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void joinSwarm(SwarmJoin swarmJoin) throws DockerException, InterruptedException;
+
+  /**
+   * Leave a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void leaveSwarm() throws DockerException, InterruptedException;
+
+  /**
+   * Leave a swarm forcefully. Only available in Docker API &gt;= 1.24.
+   * Force leave swarm, even if this is the last manager or if leaving will break the cluster.
+   *
+   * @param force                 Whether to leave forcefully
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void leaveSwarm(boolean force) throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param rotateManagerToken     Set to true to rotate the worker join token.
+   * @param rotateManagerUnlockKey Set to true to rotate the manager unlock key.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException       If a server error occurred (500)
+   * @throws InterruptedException  If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   boolean rotateManagerToken,
+                   boolean rotateManagerUnlockKey,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param rotateManagerToken     Set to true to rotate the worker join token.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   boolean rotateManagerToken,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version, SwarmSpec spec) throws DockerException, InterruptedException;
+
+  /**
+   * Get an unlock key for unlocking a swarm. Only available in Docker API &gt;= 1.25.
+   *
+   * @return {@link UnlockKey}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  UnlockKey unlockKey() throws DockerException, InterruptedException;
+
+  /**
+   * Unlock a swarm. Only available in Docker API &gt;= 1.25.
+   *
+   * @param unlockKey             {@link UnlockKey}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void unlock(UnlockKey unlockKey) throws DockerException, InterruptedException;
 
   /**
    * Create a new service. Only available in Docker API &gt;= 1.24.
@@ -2784,6 +2846,61 @@ public interface DockerClient extends Closeable {
    * 
    * @throws DockerException      if a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
    */
   List<Node> listNodes() throws DockerException, InterruptedException;
+
+  /**
+   * List swarm nodes that match the given criteria. Only available in Docker API &gt;= 1.24.
+   *
+   * @param criteria Node listing and filtering options.
+   * @return A list of nodes.
+   *
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
+   */
+  List<Node> listNodes(final Node.Criteria criteria) throws DockerException, InterruptedException;
+
+  /**
+   * Inspects a swarm node. Only available in Docker API &gt;= 1.24.
+   *
+   * @param nodeId The id of the swarm node to inspect
+   * @return info about the node
+   *
+   * @throws NonSwarmNodeException if the node is not part of a swarm (503)
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException if the thread is interrupted
+   * @since Docker 1.12, API Version 1.24
+   */
+  NodeInfo inspectNode(final String nodeId) throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm node. Only available in Docker API &gt;= 1.24.
+   *
+   * @param nodeId The id of the node to update
+   * @param version The version number of the node object being updated.
+   *                This is required to avoid conflicting writes
+   * @throws NodeNotFoundException If the node doesn't exist (404)
+   * @throws NonSwarmNodeException If the node is not part of a swarm (503)
+   * @throws DockerException If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
+   */
+  void updateNode(final String nodeId, final Long version, final NodeSpec nodeSpec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Remove a node from the swarm.
+   * @param nodeId The id of the node to remove.
+   */
+  void deleteNode(final String nodeId) throws DockerException, InterruptedException;
+
+  /**
+   * Remove a node from the swarm.
+   * @param nodeId The id of the node to remove.
+   * @param force  Forcefully remove the node.
+   */
+  void deleteNode(final String nodeId, final boolean force) throws DockerException,
+                                                                   InterruptedException;
 }
