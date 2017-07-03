@@ -47,16 +47,18 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.base.Supplier;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.CharStreams;
 import com.google.common.net.HostAndPort;
+import com.spotify.docker.client.auth.ConfigFileRegistryAuthSupplier;
+import com.spotify.docker.client.auth.NoOpRegistryAuthSupplier;
+import com.spotify.docker.client.auth.RegistryAuthSupplier;
 import com.spotify.docker.client.exceptions.BadParamException;
 import com.spotify.docker.client.exceptions.ConflictException;
 import com.spotify.docker.client.exceptions.ContainerNotFoundException;
@@ -70,6 +72,7 @@ import com.spotify.docker.client.exceptions.ExecNotFoundException;
 import com.spotify.docker.client.exceptions.ExecStartConflictException;
 import com.spotify.docker.client.exceptions.ImageNotFoundException;
 import com.spotify.docker.client.exceptions.NetworkNotFoundException;
+import com.spotify.docker.client.exceptions.NodeNotFoundException;
 import com.spotify.docker.client.exceptions.NonSwarmNodeException;
 import com.spotify.docker.client.exceptions.NotFoundException;
 import com.spotify.docker.client.exceptions.PermissionException;
@@ -107,13 +110,19 @@ import com.spotify.docker.client.messages.Version;
 import com.spotify.docker.client.messages.Volume;
 import com.spotify.docker.client.messages.VolumeList;
 import com.spotify.docker.client.messages.swarm.Node;
+import com.spotify.docker.client.messages.swarm.NodeInfo;
+import com.spotify.docker.client.messages.swarm.NodeSpec;
 import com.spotify.docker.client.messages.swarm.Secret;
 import com.spotify.docker.client.messages.swarm.SecretCreateResponse;
 import com.spotify.docker.client.messages.swarm.SecretSpec;
 import com.spotify.docker.client.messages.swarm.Service;
 import com.spotify.docker.client.messages.swarm.ServiceSpec;
 import com.spotify.docker.client.messages.swarm.Swarm;
+import com.spotify.docker.client.messages.swarm.SwarmInit;
+import com.spotify.docker.client.messages.swarm.SwarmJoin;
+import com.spotify.docker.client.messages.swarm.SwarmSpec;
 import com.spotify.docker.client.messages.swarm.Task;
+import com.spotify.docker.client.messages.swarm.UnlockKey;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.Closeable;
 import java.io.IOException;
@@ -149,6 +158,8 @@ import javax.ws.rs.client.Invocation;
 import javax.ws.rs.client.ResponseProcessingException;
 import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.GenericType;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
 import org.apache.commons.compress.utils.IOUtils;
 import org.apache.http.client.config.RequestConfig;
@@ -166,6 +177,8 @@ import org.glassfish.hk2.api.MultiException;
 import org.glassfish.jersey.apache.connector.ApacheClientProperties;
 import org.glassfish.jersey.apache.connector.ApacheConnectorProvider;
 import org.glassfish.jersey.client.ClientConfig;
+import org.glassfish.jersey.client.ClientProperties;
+import org.glassfish.jersey.client.RequestEntityProcessing;
 import org.glassfish.jersey.internal.util.Base64;
 import org.glassfish.jersey.jackson.JacksonFeature;
 import org.slf4j.Logger;
@@ -215,7 +228,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
     }
 
   }
-  
+
   /**
    * Hack: this {@link ProgressHandler} is meant to capture the image names
    * of an image being loaded. Weirdly enough, Docker returns the name of a newly
@@ -250,7 +263,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
         if (streamMatcher.matches()) {
           imageNames.add(streamMatcher.group("image"));
         }
-        
+
       }
     }
 
@@ -268,7 +281,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   private static final long DEFAULT_READ_TIMEOUT_MILLIS = SECONDS.toMillis(30);
   private static final int DEFAULT_CONNECTION_POOL_SIZE = 100;
 
-  private static final ClientConfig DEFAULT_CONFIG = new ClientConfig(
+  private final ClientConfig defaultConfig = new ClientConfig(
       ObjectMapperProvider.class,
       JacksonFeature.class,
       LogsResponseReader.class,
@@ -305,14 +318,6 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       new GenericType<List<ImageHistory>>() {
       };
 
-  private static final Supplier<ClientBuilder> DEFAULT_BUILDER_SUPPLIER =
-      new Supplier<ClientBuilder>() {
-        @Override
-        public ClientBuilder get() {
-          return ClientBuilder.newBuilder();
-        }
-      };
-
   private static final GenericType<List<Service>> SERVICE_LIST =
       new GenericType<List<Service>>() {
       };
@@ -320,7 +325,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   private static final GenericType<List<Task>> TASK_LIST = new GenericType<List<Task>>() { };
 
   private static final GenericType<List<Node>> NODE_LIST = new GenericType<List<Node>>() { };
-  
+
   private static final GenericType<List<Secret>> SECRET_LIST = new GenericType<List<Secret>>() { };
 
   private final Client client;
@@ -328,7 +333,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
 
   private final URI uri;
   private final String apiVersion;
-  private final RegistryAuth registryAuth;
+  private final RegistryAuthSupplier registryAuthSupplier;
 
   private final Map<String, Object> headers;
 
@@ -374,11 +379,6 @@ public class DefaultDockerClient implements DockerClient, Closeable {
    * @param builder DefaultDockerClient builder
    */
   protected DefaultDockerClient(final Builder builder) {
-    this(builder, DEFAULT_BUILDER_SUPPLIER);
-  }
-
-  @VisibleForTesting
-  DefaultDockerClient(final Builder builder, Supplier<ClientBuilder> clientBuilderSupplier) {
     final URI originalUri = checkNotNull(builder.uri, "uri");
     this.apiVersion = builder.apiVersion();
 
@@ -402,14 +402,20 @@ public class DefaultDockerClient implements DockerClient, Closeable {
         .setSocketTimeout((int) builder.readTimeoutMillis)
         .build();
 
-    final ClientConfig config = DEFAULT_CONFIG
+    final ClientConfig config = updateProxy(defaultConfig)
         .connectorProvider(new ApacheConnectorProvider())
         .property(ApacheClientProperties.CONNECTION_MANAGER, cm)
         .property(ApacheClientProperties.REQUEST_CONFIG, requestConfig);
 
-    this.registryAuth = builder.registryAuth;
+    if (builder.registryAuthSupplier == null) {
+      this.registryAuthSupplier = new NoOpRegistryAuthSupplier();
+    } else {
+      this.registryAuthSupplier = builder.registryAuthSupplier;
+    }
 
-    this.client = clientBuilderSupplier.get().withConfig(config).build();
+    this.client = ClientBuilder.newBuilder()
+        .withConfig(config)
+        .build();
 
     // ApacheConnector doesn't respect per-request timeout settings.
     // Workaround: instead create a client with infinite read timeout,
@@ -417,13 +423,25 @@ public class DefaultDockerClient implements DockerClient, Closeable {
     final RequestConfig noReadTimeoutRequestConfig = RequestConfig.copy(requestConfig)
         .setSocketTimeout((int) NO_TIMEOUT)
         .build();
-    this.noTimeoutClient = clientBuilderSupplier.get()
+    this.noTimeoutClient = ClientBuilder.newBuilder()
         .withConfig(config)
         .property(ApacheClientProperties.CONNECTION_MANAGER, noTimeoutCm)
         .property(ApacheClientProperties.REQUEST_CONFIG, noReadTimeoutRequestConfig)
         .build();
 
     this.headers = new HashMap<>(builder.headers());
+  }
+
+  private ClientConfig updateProxy(ClientConfig config) {
+    final String proxyHost = System.getProperty("http.proxyHost");
+    if (proxyHost != null) {
+      config.property(ClientProperties.PROXY_URI, proxyHost + ":"
+              + checkNotNull(System.getProperty("http.proxyPort"), "http.proxyPort"));
+
+      //ensure Content-Length is populated before sending request via proxy.
+      config.property(ClientProperties.REQUEST_ENTITY_PROCESSING, RequestEntityProcessing.BUFFERED);
+    }
+    return config;
   }
 
   public String getHost() {
@@ -500,10 +518,25 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     WebTarget resource = resource()
         .path("containers").path("json");
+    resource = addParameters(resource, params);
 
+    try {
+      return request(GET, CONTAINER_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 400:
+          throw new BadParamException(getQueryParamMap(resource), e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  private WebTarget addParameters(WebTarget resource, final Param... params)
+      throws DockerException {
     final Map<String, List<String>> filters = newHashMap();
-    for (final ListContainersParam param : params) {
-      if (param instanceof ListContainersFilterParam) {
+    for (final Param param : params) {
+      if (param instanceof FilterParam) {
         List<String> filterValueList;
         if (filters.containsKey(param.name())) {
           filterValueList = filters.get(param.name());
@@ -523,17 +556,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       // urlEncodeFilters will return null and queryParam() will remove that query parameter.
       resource = resource.queryParam("filters", urlEncodeFilters(filters));
     }
-
-    try {
-      return request(GET, CONTAINER_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
-    } catch (DockerRequestException e) {
-      switch (e.status()) {
-        case 400:
-          throw new BadParamException(getQueryParamMap(resource), e);
-        default:
-          throw e;
-      }
-    }
+    return resource;
   }
 
   private Map<String, String> getQueryParamMap(final WebTarget resource) {
@@ -587,30 +610,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     WebTarget resource = resource()
         .path("images").path("json");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final ListImagesParam param : params) {
-      if (param instanceof ListImagesFilterParam) {
-        final List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
-
+    resource = addParameters(resource, params);
     return request(GET, IMAGE_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
   }
 
@@ -661,9 +661,21 @@ public class DefaultDockerClient implements DockerClient, Closeable {
 
   private void containerAction(final String containerId, final String action)
       throws DockerException, InterruptedException {
+    containerAction(containerId, action, new MultivaluedHashMap<String, String>());
+  }
+
+  private void containerAction(final String containerId, final String action,
+                               final MultivaluedMap<String, String> queryParameters)
+          throws DockerException, InterruptedException {
     try {
       final WebTarget resource = resource()
-          .path("containers").path(containerId).path(action);
+              .path("containers").path(containerId).path(action);
+
+      for (Map.Entry<String, List<String>> queryParameter : queryParameters.entrySet()) {
+        for (String parameterValue : queryParameter.getValue()) {
+          resource.queryParam(queryParameter.getKey(), parameterValue);
+        }
+      }
       request(POST, resource, resource.request());
     } catch (DockerRequestException e) {
       switch (e.status()) {
@@ -699,25 +711,28 @@ public class DefaultDockerClient implements DockerClient, Closeable {
       throws DockerException, InterruptedException {
     checkNotNull(containerId, "containerId");
     checkNotNull(secondsToWaitBeforeRestart, "secondsToWait");
-    try {
-      final WebTarget resource = resource().path("containers").path(containerId)
-          .path("restart")
-          .queryParam("t", String.valueOf(secondsToWaitBeforeRestart));
-      request(POST, resource, resource.request());
-    } catch (DockerRequestException e) {
-      switch (e.status()) {
-        case 404:
-          throw new ContainerNotFoundException(containerId, e);
-        default:
-          throw e;
-      }
-    }
-  }
 
+    MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+    queryParameters.add("t", String.valueOf(secondsToWaitBeforeRestart));
+
+    containerAction(containerId, "restart", queryParameters);
+  }
 
   @Override
   public void killContainer(final String containerId) throws DockerException, InterruptedException {
+    checkNotNull(containerId, "containerId");
     containerAction(containerId, "kill");
+  }
+
+  @Override
+  public void killContainer(final String containerId, final Signal signal)
+      throws DockerException, InterruptedException {
+    checkNotNull(containerId, "containerId");
+
+    MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+    queryParameters.add("signal", signal.getName());
+
+    containerAction(containerId, "kill", queryParameters);
   }
 
   @Override
@@ -1081,27 +1096,11 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   @Override
   @Deprecated
   public void load(final String image, final InputStream imagePayload,
-                   final RegistryAuth registryAuth)
-      throws DockerException, InterruptedException {
-    create(image, imagePayload);
-  }
-
-  @Override
-  @Deprecated
-  public void load(final String image, final InputStream imagePayload,
                    final ProgressHandler handler)
       throws DockerException, InterruptedException {
     create(image, imagePayload, handler);
   }
 
-  @Override
-  @Deprecated
-  public void load(final String image, final InputStream imagePayload,
-                   final RegistryAuth registryAuth, final ProgressHandler handler)
-      throws DockerException, InterruptedException {
-    create(image, imagePayload, handler);
-  }
-  
   @Override
   public Set<String> load(final InputStream imagePayload)
       throws DockerException, InterruptedException {
@@ -1115,10 +1114,10 @@ public class DefaultDockerClient implements DockerClient, Closeable {
             .path("images")
             .path("load")
             .queryParam("quiet", "false");
-    
+
     final LoadProgressHandler loadProgressHandler = new LoadProgressHandler(handler);
     final Entity<InputStream> entity = Entity.entity(imagePayload, APPLICATION_OCTET_STREAM);
-    
+
     try (final ProgressStream load =
             request(POST, ProgressStream.class, resource,
                     resource.request(APPLICATION_JSON_TYPE), entity)) {
@@ -1187,28 +1186,20 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   }
 
   @Override
-  @Deprecated
-  public InputStream save(final String image, final RegistryAuth registryAuth)
-      throws DockerException, IOException, InterruptedException {
-    return save(image);
-  }
-
-  @Override
   public InputStream saveMultiple(final String... images)
       throws DockerException, IOException, InterruptedException {
 
     final WebTarget resource = resource().path("images").path("get");
-    if (images != null) {
-      for (final String image : images) {
-        resource.queryParam("names", urlEncode(image));
-      }
+    for (final String image : images) {
+      resource.queryParam("names", urlEncode(image));
     }
 
     return request(
         GET,
         InputStream.class,
         resource,
-        resource.request(APPLICATION_JSON_TYPE).header("X-Registry-Auth", authHeader(registryAuth))
+        resource.request(APPLICATION_JSON_TYPE).header("X-Registry-Auth", authHeader(
+            registryAuthSupplier.authFor(images[0])))
     );
   }
 
@@ -1220,7 +1211,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   @Override
   public void pull(final String image, final ProgressHandler handler)
       throws DockerException, InterruptedException {
-    pull(image, registryAuth, handler);
+    pull(image, registryAuthSupplier.authFor(image), handler);
   }
 
   @Override
@@ -1274,7 +1265,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   @Override
   public void push(final String image, final ProgressHandler handler)
       throws DockerException, InterruptedException {
-    push(image, handler, registryAuth);
+    push(image, handler, registryAuthSupplier.authFor(image));
   }
 
   @Override
@@ -1393,18 +1384,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
     }
 
     // Convert auth to X-Registry-Config format
-    final RegistryConfigs registryConfigs;
-    if (registryAuth == null) {
-      registryConfigs = RegistryConfigs.empty();
-    } else {
-      registryConfigs = RegistryConfigs.create(singletonMap(
-          registryAuth.serverAddress(),
-          RegistryConfigs.RegistryConfig.create(
-              registryAuth.serverAddress(),
-              registryAuth.username(),
-              registryAuth.password(),
-              registryAuth.email())));
-    }
+    final RegistryConfigs registryConfigs = registryAuthSupplier.authForBuild();
 
     try (final CompressedDirectory compressedDirectory = CompressedDirectory.create(directory);
          final InputStream fileStream = Files.newInputStream(compressedDirectory.file());
@@ -1506,29 +1486,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   public EventStream events(EventsParam... params)
       throws DockerException, InterruptedException {
     WebTarget resource = noTimeoutResource().path("events");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final EventsParam param : params) {
-      if (param instanceof EventsFilterParam) {
-        final List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
+    resource = addParameters(resource, params);
 
     try {
       final CloseableHttpClient client = (CloseableHttpClient) ApacheConnectorProvider
@@ -1674,10 +1632,172 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   }
 
   @Override
+  public String initSwarm(final SwarmInit swarmInit) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    try {
+      final WebTarget resource = resource().path("swarm").path("init");
+      return request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE),
+          Entity.json(swarmInit));
+
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 400:
+          throw new DockerException("bad parameter", e);
+        case 500:
+          throw new DockerException("server error", e);
+        case 503:
+          throw new DockerException("node is already part of a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void joinSwarm(final SwarmJoin swarmJoin) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    try {
+      final WebTarget resource = resource().path("swarm").path("join");
+      request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE),
+          Entity.json(swarmJoin));
+
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 400:
+          throw new DockerException("bad parameter", e);
+        case 500:
+          throw new DockerException("server error", e);
+        case 503:
+          throw new DockerException("node is already part of a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void leaveSwarm() throws DockerException, InterruptedException {
+    leaveSwarm(false);
+  }
+
+  @Override
+  public void leaveSwarm(final boolean force) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    try {
+      final WebTarget resource = resource().path("swarm").path("leave").queryParam("force", force);
+      request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE));
+
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 500:
+          throw new DockerException("server error", e);
+        case 503:
+          throw new DockerException("node is not part of a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void updateSwarm(final Long version,
+                          final boolean rotateWorkerToken,
+                          final boolean rotateManagerToken,
+                          final boolean rotateManagerUnlockKey,
+                          final SwarmSpec spec)
+      throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    try {
+      final WebTarget resource = resource().path("swarm").path("update")
+          .queryParam("version", version)
+          .queryParam("rotateWorkerToken", rotateWorkerToken)
+          .queryParam("rotateManagerToken", rotateManagerToken)
+          .queryParam("rotateManagerUnlockKey", rotateManagerUnlockKey);
+
+      request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE),
+          Entity.json(spec));
+
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 400:
+          throw new DockerException("bad parameter", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void updateSwarm(final Long version,
+                          final boolean rotateWorkerToken,
+                          final boolean rotateManagerToken,
+                          final SwarmSpec spec)
+      throws DockerException, InterruptedException {
+    updateSwarm(version, rotateWorkerToken, rotateWorkerToken, false, spec);
+  }
+
+  @Override
+  public void updateSwarm(final Long version,
+                          final boolean rotateWorkerToken,
+                          final SwarmSpec spec)
+      throws DockerException, InterruptedException {
+    updateSwarm(version, rotateWorkerToken, false, false, spec);
+  }
+
+  @Override
+  public void updateSwarm(final Long version,
+                          final SwarmSpec spec)
+      throws DockerException, InterruptedException {
+    updateSwarm(version, false, false, false, spec);
+  }
+
+  @Override
+  public UnlockKey unlockKey() throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+    try {
+      final WebTarget resource = resource().path("swarm").path("unlockkey");
+
+      return request(GET, UnlockKey.class, resource, resource.request(APPLICATION_JSON_TYPE));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 500:
+          throw new DockerException("server error", e);
+        case 503:
+          throw new DockerException("node is not part of a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void unlock(final UnlockKey unlockKey) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+    try {
+      final WebTarget resource = resource().path("swarm").path("unlock");
+
+      request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE),
+          Entity.json(unlockKey));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 500:
+          throw new DockerException("server error", e);
+        case 503:
+          throw new DockerException("node is not part of a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
   public ServiceCreateResponse createService(ServiceSpec spec)
       throws DockerException, InterruptedException {
-
-    return createService(spec, registryAuth);
+    return createService(spec, registryAuthSupplier.authForSwarm());
   }
 
   @Override
@@ -1853,7 +1973,107 @@ public class DefaultDockerClient implements DockerClient, Closeable {
     WebTarget resource = resource().path("nodes");
     return request(GET, NODE_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
   }
-  
+
+  @Override
+  public List<Node> listNodes(Node.Criteria criteria) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+    final Map<String, List<String>> filters = new HashMap<>();
+
+    if (criteria.nodeId() != null) {
+      filters.put("id", Collections.singletonList(criteria.nodeId()));
+    }
+    if (criteria.label() != null) {
+      filters.put("label", Collections.singletonList(criteria.label()));
+    }
+    if (criteria.membership() != null) {
+      filters.put("membership", Collections.singletonList(criteria.membership()));
+    }
+    if (criteria.nodeName() != null) {
+      filters.put("name", Collections.singletonList(criteria.nodeName()));
+    }
+    if (criteria.nodeRole() != null) {
+      filters.put("role", Collections.singletonList(criteria.nodeRole()));
+    }
+
+    WebTarget resource = resource().path("nodes");
+    resource = resource.queryParam("filters", urlEncodeFilters(filters));
+    return request(GET, NODE_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
+  }
+
+  @Override
+  public NodeInfo inspectNode(final String nodeId) throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    WebTarget resource = resource().path("nodes")
+        .path(nodeId);
+
+    try {
+      return request(GET, NodeInfo.class, resource, resource.request(APPLICATION_JSON_TYPE));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 404:
+          throw new NodeNotFoundException(nodeId);
+        case 503:
+          throw new NonSwarmNodeException("Node " + nodeId + " is not in a swarm", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void updateNode(final String nodeId, final Long version, final NodeSpec nodeSpec)
+      throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    WebTarget resource = resource().path("nodes")
+        .path(nodeId)
+        .path("update")
+        .queryParam("version", version);
+
+    try {
+      request(POST, String.class, resource, resource.request(APPLICATION_JSON_TYPE),
+          Entity.json(nodeSpec));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 404:
+          throw new NodeNotFoundException(nodeId);
+        case 503:
+          throw new NonSwarmNodeException("Node " + nodeId + " is not a swarm node", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
+  @Override
+  public void deleteNode(final String nodeId) throws DockerException, InterruptedException {
+    deleteNode(nodeId, false);
+  }
+
+  @Override
+  public void deleteNode(final String nodeId, final boolean force)
+      throws DockerException, InterruptedException {
+    assertApiVersionIsAbove("1.24");
+
+    final WebTarget resource = resource().path("nodes")
+        .path(nodeId)
+        .queryParam("force", String.valueOf(force));
+
+    try {
+      request(DELETE, resource, resource.request(APPLICATION_JSON_TYPE));
+    } catch (DockerRequestException e) {
+      switch (e.status()) {
+        case 404:
+          throw new NodeNotFoundException(nodeId);
+        case 503:
+          throw new NonSwarmNodeException("Node " + nodeId + " is not a swarm node", e);
+        default:
+          throw e;
+      }
+    }
+  }
+
   @Override
   public void execResizeTty(final String execId,
                             final Integer height,
@@ -1951,8 +2171,10 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   }
 
   @Override
-  public List<Network> listNetworks() throws DockerException, InterruptedException {
-    final WebTarget resource = resource().path("networks");
+  public List<Network> listNetworks(final ListNetworksParam... params)
+      throws DockerException, InterruptedException {
+    WebTarget resource = resource().path("networks");
+    resource = addParameters(resource, params);
     return request(GET, NETWORK_LIST, resource, resource.request(APPLICATION_JSON_TYPE));
   }
 
@@ -2116,30 +2338,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
   public VolumeList listVolumes(ListVolumesParam... params)
       throws DockerException, InterruptedException {
     WebTarget resource = resource().path("volumes");
-
-    final Map<String, List<String>> filters = newHashMap();
-    for (final ListVolumesParam param : params) {
-      if (param instanceof ListVolumesFilterParam) {
-        List<String> filterValueList;
-        if (filters.containsKey(param.name())) {
-          filterValueList = filters.get(param.name());
-        } else {
-          filterValueList = Lists.newArrayList();
-        }
-        filterValueList.add(param.value());
-        filters.put(param.name(), filterValueList);
-      } else {
-        resource = resource.queryParam(urlEncode(param.name()), urlEncode(param.value()));
-      }
-    }
-
-    if (!filters.isEmpty()) {
-      // If filters were specified, we must put them in a JSON object and pass them using the
-      // 'filters' query param like this: filters={"dangling":["true"]}. If filters is an empty map,
-      // urlEncodeFilters will return null and queryParam() will remove that query parameter.
-      resource = resource.queryParam("filters", urlEncodeFilters(filters));
-    }
-
+    resource = addParameters(resource, params);
     return request(GET, VolumeList.class, resource, resource.request(APPLICATION_JSON_TYPE));
   }
 
@@ -2427,6 +2626,10 @@ public class DefaultDockerClient implements DockerClient, Closeable {
 
   public static class Builder {
 
+    public static final String ERROR_MESSAGE =
+        "LOGIC ERROR: DefaultDockerClient does not support being built "
+        + "with both `registryAuth` and `registryAuthSupplier`. "
+        + "Please build with at most one of these options.";
     private URI uri;
     private String apiVersion;
     private long connectTimeoutMillis = DEFAULT_CONNECT_TIMEOUT_MILLIS;
@@ -2435,6 +2638,7 @@ public class DefaultDockerClient implements DockerClient, Closeable {
     private DockerCertificatesStore dockerCertificatesStore;
     private boolean dockerAuth;
     private RegistryAuth registryAuth;
+    private RegistryAuthSupplier registryAuthSupplier;
     private Map<String, Object> headers = new HashMap<>();
 
     public URI uri() {
@@ -2545,7 +2749,9 @@ public class DefaultDockerClient implements DockerClient, Closeable {
      *
      * @param dockerAuth tells if Docker auth info should be used
      * @return Builder
+     * @deprecated in favor of {@link #registryAuthSupplier(RegistryAuthSupplier)}
      */
+    @Deprecated
     public Builder dockerAuth(final boolean dockerAuth) {
       this.dockerAuth = dockerAuth;
       return this;
@@ -2560,23 +2766,39 @@ public class DefaultDockerClient implements DockerClient, Closeable {
      *
      * @param registryAuth RegistryAuth object
      * @return Builder
+     *
+     * @deprecated in favor of {@link #registryAuthSupplier(RegistryAuthSupplier)}
      */
+    @Deprecated
     public Builder registryAuth(final RegistryAuth registryAuth) {
+      if (this.registryAuthSupplier != null) {
+        throw new IllegalStateException(ERROR_MESSAGE);
+      }
       this.registryAuth = registryAuth;
+
+      // stuff the static RegistryAuth into a RegistryConfigs instance to maintain what
+      // DefaultDockerClient used to do with the RegistryAuth before we introduced the
+      // RegistryAuthSupplier
+      final RegistryConfigs configs = RegistryConfigs.create(singletonMap(
+          MoreObjects.firstNonNull(registryAuth.serverAddress(), ""),
+          registryAuth
+      ));
+
+      this.registryAuthSupplier = new NoOpRegistryAuthSupplier(registryAuth, configs);
       return this;
     }
 
-    public DefaultDockerClient build() {
-      if (dockerAuth) {
-        try {
-          this.registryAuth = RegistryAuth.fromDockerConfig().build();
-        } catch (IOException e) {
-          log.warn("Unable to use Docker auth info", e);
-        }
+    public Builder registryAuthSupplier(final RegistryAuthSupplier registryAuthSupplier) {
+      if (this.registryAuthSupplier != null) {
+        throw new IllegalStateException(ERROR_MESSAGE);
       }
-      return new DefaultDockerClient(this);
+      this.registryAuthSupplier = registryAuthSupplier;
+      return this;
     }
 
+    /**
+     * Adds additional headers to be sent in all requests to the Docker Remote API.
+     */
     public Builder header(String name, Object value) {
       headers.put(name, value);
       return this;
@@ -2584,6 +2806,23 @@ public class DefaultDockerClient implements DockerClient, Closeable {
 
     public Map<String, Object> headers() {
       return headers;
+    }
+
+    public DefaultDockerClient build() {
+      if (dockerAuth && registryAuthSupplier == null && registryAuth == null) {
+        try {
+          registryAuth(RegistryAuth.fromDockerConfig().build());
+        } catch (IOException e) {
+          log.warn("Unable to use Docker auth info", e);
+        }
+      }
+
+      // read the docker config file for auth info if nothing else was specified
+      if (registryAuthSupplier == null) {
+        registryAuthSupplier(new ConfigFileRegistryAuthSupplier());
+      }
+
+      return new DefaultDockerClient(this);
     }
   }
 

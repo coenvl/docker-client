@@ -22,6 +22,8 @@
 package com.spotify.docker.client;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.spotify.docker.client.messages.Network.Type.BUILTIN;
+import static com.spotify.docker.client.messages.Network.Type.CUSTOM;
 
 import com.spotify.docker.client.exceptions.BadParamException;
 import com.spotify.docker.client.exceptions.ConflictException;
@@ -31,6 +33,8 @@ import com.spotify.docker.client.exceptions.DockerException;
 import com.spotify.docker.client.exceptions.ExecNotFoundException;
 import com.spotify.docker.client.exceptions.ImageNotFoundException;
 import com.spotify.docker.client.exceptions.NetworkNotFoundException;
+import com.spotify.docker.client.exceptions.NodeNotFoundException;
+import com.spotify.docker.client.exceptions.NonSwarmNodeException;
 import com.spotify.docker.client.exceptions.NotFoundException;
 import com.spotify.docker.client.exceptions.PermissionException;
 import com.spotify.docker.client.exceptions.UnsupportedApiVersionException;
@@ -63,13 +67,19 @@ import com.spotify.docker.client.messages.Version;
 import com.spotify.docker.client.messages.Volume;
 import com.spotify.docker.client.messages.VolumeList;
 import com.spotify.docker.client.messages.swarm.Node;
+import com.spotify.docker.client.messages.swarm.NodeInfo;
+import com.spotify.docker.client.messages.swarm.NodeSpec;
 import com.spotify.docker.client.messages.swarm.Secret;
 import com.spotify.docker.client.messages.swarm.SecretCreateResponse;
 import com.spotify.docker.client.messages.swarm.SecretSpec;
 import com.spotify.docker.client.messages.swarm.Service;
 import com.spotify.docker.client.messages.swarm.ServiceSpec;
 import com.spotify.docker.client.messages.swarm.Swarm;
+import com.spotify.docker.client.messages.swarm.SwarmInit;
+import com.spotify.docker.client.messages.swarm.SwarmJoin;
+import com.spotify.docker.client.messages.swarm.SwarmSpec;
 import com.spotify.docker.client.messages.swarm.Task;
+import com.spotify.docker.client.messages.swarm.UnlockKey;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -281,47 +291,6 @@ public interface DockerClient extends Closeable {
   void load(String image, InputStream imagePayload, ProgressHandler handler)
       throws DockerException, InterruptedException;
 
-
-  /**
-   * Creates a single image from a tarball. This method also tags the image
-   * with the given image name upon loading completion.
-   *
-   * @param image        the name to assign to the image.
-   * @param imagePayload the image's payload (i.e.: the stream corresponding to the image's .tar
-   *                     file).
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated Use {@link #load(InputStream)} to load a set of image layers from a tarball. Use
-   * {@link #create(String, InputStream)} to create a single image from the contents of a tarball.
-   */
-  @Deprecated
-  void load(String image, InputStream imagePayload, RegistryAuth registryAuth)
-      throws DockerException, InterruptedException;
-
-
-  /**
-   * Creates a single image from a tarball. This method also tags the image
-   * with the given image name upon loading completion.
-   *
-   * @param image        the name to assign to the image.
-   * @param imagePayload the image's payload (i.e.: the stream corresponding to the image's .tar
-   *                     file).
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @param handler      The handler to use for processing each progress message received from
-   *                     Docker.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated Use {@link #load(InputStream)} to load a set of image layers from a tarball. Use
-   *             {@link #create(String, InputStream, ProgressHandler)} to create a single image from
-   *             the contents of a tarball.
-   */
-  @Deprecated
-  void load(String image, InputStream imagePayload, RegistryAuth registryAuth,
-            ProgressHandler handler) throws DockerException, InterruptedException;
-
   /**
    * Load a set of images and tags from a tarball.
    *
@@ -389,26 +358,6 @@ public interface DockerClient extends Closeable {
    * @throws InterruptedException if the thread is interrupted.
    */
   InputStream save(String... images) throws DockerException, IOException, InterruptedException;
-
-  /**
-   * Get a tarball containing all images and metadata for the repository specified.
-   * @param image the name or id of the image to save. If a specific name and tag
-   *              (e.g. ubuntu:latest), then only that image (and its parents) are returned.
-   *              If an image ID, similarly only that image (and its parents) are returned,
-   *              but with the exclusion of the 'repositories' file in the tarball,
-   *              as there were no image names referenced.
-   * @param registryAuth the {@link RegistryAuth} needed to pull the image.
-   * @return the image's .tar stream.
-   * @throws DockerException      if a server error occurred (500).
-   * @throws IOException          if the server started returning, but an I/O error occurred in the
-   *                              context of processing it on the client-side.
-   * @throws InterruptedException if the thread is interrupted.
-   *
-   * @deprecated RegistryAuth is not required. Use {@link #save(String...)}.
-   */
-  @Deprecated
-  InputStream save(String image, RegistryAuth registryAuth)
-      throws DockerException, IOException, InterruptedException;
 
   /**
    * Get a tarball containing all images and metadata for one or more repositories.
@@ -687,6 +636,14 @@ public interface DockerClient extends Closeable {
     public int hashCode() {
       return Objects.hash(name, value);
     }
+  }
+  
+  /**
+   * Marker interface to designate a parameter as a filter parameter.
+   * Filter parameters receive special treatment during serialization:
+   * They are all rendered into the special 'filter' query parameter.
+   */
+  interface FilterParam {
   }
 
   /**
@@ -991,9 +948,7 @@ public interface DockerClient extends Closeable {
 
   /**
    * Kill a docker container.
-   * Note: This implementation deviates from the Docker Remote API. The
-   * latter accepts the kill signal as an argument. This implementation does
-   * not accept the signal argument; instead, the default SIGKILL is sent.
+   * Note: by default SIGKILL is sent.
    *
    * @param containerId The id of the container to kill.
    * @throws ContainerNotFoundException
@@ -1002,6 +957,213 @@ public interface DockerClient extends Closeable {
    * @throws InterruptedException If the thread is interrupted
    */
   void killContainer(String containerId) throws DockerException, InterruptedException;
+
+  /**
+   * Kill a docker container.
+   * @param containerId The id of the container to kill.
+   * @param signal Signal used to kill the process.
+   * @throws ContainerNotFoundException
+   *                              if container is not found (404)
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void killContainer(final String containerId, final Signal signal)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Supported parameters for {@link #killContainer(String, Signal)}).
+   */
+  enum Signal {
+    /**
+     * Signal number: 1.
+     * Hangup (POSIX)
+     */
+    SIGHUP("SIGHUP"),
+
+    /**
+     * Signal number: 2.
+     * Terminal interrupt (ANSI)
+     */
+    SIGINT("SIGINT"),
+
+    /**
+     * Signal number: 3.
+     * Terminal quit (POSIX)
+     */
+    SIGQUIT("SIGQUIT"),
+
+    /**
+     * Signal number: 4.
+     * Illegal instruction (ANSI)
+     */
+    SIGILL("SIGILL"),
+
+    /**
+     * Signal number: 5.
+     * Trace trap (POSIX)
+     */
+    SIGTRAP("SIGTRAP"),
+
+    /**
+     * Signal number: 6.
+     * IOT trap (4.2 BSD)
+     */
+    SIGIOT("SIGIOT"),
+
+    /**
+     * Signal number: 7.
+     * BUS error (4.2 BSD)
+     */
+    SIGBUS("SIGBUS"),
+
+    /**
+     * Signal number: 8.
+     * Floating point exception (ANSI)
+     */
+    SIGFPE("SIGFPE"),
+
+    /**
+     * Signal number: 9.
+     * Kill (POSIX)
+     */
+    SIGKILL("SIGKILL"),
+
+    /**
+     * Signal number: 10.
+     * User defined signal 1 (POSIX)
+     */
+    SIGUSR1("SIGUSR1"),
+
+    /**
+     * Signal number: 11.
+     * Invalid memory segment address (ANSI)
+     */
+    SIGSEGV("SIGSEGV"),
+
+    /**
+     * Signal number: 12.
+     * User defined signal 2 (POSIX)
+     */
+    SIGUSR2("SIGUSR2"),
+
+    /**
+     * Signal number: 13.
+     * Write on a pipe with no reader, broken pipe (POSIX)
+     */
+    SIGPIPE("SIGPIPE"),
+
+    /**
+     * Signal number: 14.
+     * Alarm clock (POSIX)
+     */
+    SIGALRM("SIGALRM"),
+
+    /**
+     * Signal number: 15.
+     * Termination (ANSI)
+     */
+    SIGTERM("SIGTERM"),
+
+    /**
+     * Signal number: 16.
+     * Stack fault.
+     */
+    SIGSTKFLT("SIGSTKFLT"),
+
+    /**
+     * Signal number: 17.
+     * Child process has stopped or exited, changed (POSIX)
+     */
+    SIGCHLD("SIGCHLD"),
+
+    /**
+     * Signal number: 18.
+     * Continue executing if stopped (POSIX)
+     */
+    SIGCONT("SIGCONT"),
+
+    /**
+     * Signal number: 19.
+     * Stop executing (POSIX)
+     */
+    SIGSTOP("SIGSTOP"),
+
+    /**
+     * Signal number: 20.
+     * Terminal stop signal (POSIX)
+     */
+    SIGTSTP("SIGTSTP"),
+
+    /**
+     * Signal number: 21.
+     * Background process trying to read from TTY
+     */
+    SIGTTIN("SIGTTIN"),
+
+    /**
+     * Signal number: 22.
+     * Background process trying to write to TTY
+     */
+    SIGTTOU("SIGTTOU"),
+
+    /**
+     * Signal number: 23.
+     * Urgen condition on socket (4.2 BSD)
+     */
+    SIGURG("SIGURG"),
+
+    /**
+     * Signal number: 24.
+     * CPU limit exceeded (4.2 BSD)
+     */
+    SIGXCPU("SIGXCPU"),
+
+    /**
+     * Signal number: 25.
+     * File size limit exceeded (4.2 BSD)
+     */
+    SIGXFSZ("SIGXFSZ"),
+
+    /**
+     * Signal number: 26.
+     * Virtual alarm clock (4.2 BSD)
+     */
+    SIGVTALRM("SIGVTALRM"),
+
+    /**
+     * Signal number: 27.
+     * Profiling alarm clock (4.2 BSD)
+     */
+    SIGPROF("SIGPROF"),
+
+    /**
+     * Signal number: 28.
+     * Window size change (4.3 BSD, Sun)
+     */
+    SIGWINCH("SIGWINCH"),
+
+    /**
+     * Signal number: 29.
+     * I/O now possible (4.2 BSD)
+     */
+    SIGIO("SIGIO"),
+
+    /**
+     * Signal number: 30.
+     * Power failure restart (System V)
+     */
+    SIGPWR("SIGPWR");
+
+    private final String name;
+
+    Signal(String name) {
+      this.name = name;
+    }
+
+    public String getName() {
+      return name;
+    }
+  }
 
   /**
    * Remove a docker container.
@@ -1267,13 +1429,128 @@ public interface DockerClient extends Closeable {
       throws DockerException, InterruptedException;
 
   /**
-   * Inspect the Swarm cluster. Only available in Docker API &gt;= 1.24.
+   * Inspect the swarm. Only available in Docker API &gt;= 1.24.
    *
    * @return Info about a swarm
-   * @throws DockerException      if a server error occurred (500)
+   * @throws DockerException      If a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
    */
   Swarm inspectSwarm() throws DockerException, InterruptedException;
+
+  /**
+   * Initialize a new swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @return Node ID
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  String initSwarm(SwarmInit swarmInit) throws DockerException, InterruptedException;
+
+  /**
+   * Join an existing swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void joinSwarm(SwarmJoin swarmJoin) throws DockerException, InterruptedException;
+
+  /**
+   * Leave a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void leaveSwarm() throws DockerException, InterruptedException;
+
+  /**
+   * Leave a swarm forcefully. Only available in Docker API &gt;= 1.24.
+   * Force leave swarm, even if this is the last manager or if leaving will break the cluster.
+   *
+   * @param force                 Whether to leave forcefully
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void leaveSwarm(boolean force) throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param rotateManagerToken     Set to true to rotate the worker join token.
+   * @param rotateManagerUnlockKey Set to true to rotate the manager unlock key.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException       If a server error occurred (500)
+   * @throws InterruptedException  If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   boolean rotateManagerToken,
+                   boolean rotateManagerUnlockKey,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param rotateManagerToken     Set to true to rotate the worker join token.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   boolean rotateManagerToken,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param rotateWorkerToken      Set to true to rotate the worker join token.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version,
+                   boolean rotateWorkerToken,
+                   SwarmSpec spec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm. Only available in Docker API &gt;= 1.24.
+   *
+   * @param version                The version number of the swarm object being updated.
+   *                               This is required to avoid conflicting writes.
+   * @param spec                   {@link SwarmSpec}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void updateSwarm(Long version, SwarmSpec spec) throws DockerException, InterruptedException;
+
+  /**
+   * Get an unlock key for unlocking a swarm. Only available in Docker API &gt;= 1.25.
+   *
+   * @return {@link UnlockKey}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  UnlockKey unlockKey() throws DockerException, InterruptedException;
+
+  /**
+   * Unlock a swarm. Only available in Docker API &gt;= 1.25.
+   *
+   * @param unlockKey             {@link UnlockKey}
+   * @throws DockerException      If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   */
+  void unlock(UnlockKey unlockKey) throws DockerException, InterruptedException;
 
   /**
    * Create a new service. Only available in Docker API &gt;= 1.24.
@@ -1462,14 +1739,138 @@ public interface DockerClient extends Closeable {
 
 
   /**
-   * List all networks.
+   * List all or a subset of the networks.
+   * Filters were added in Docker 1.10, API version 1.22.
    *
    * @return networks
    * @throws DockerException      if a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
    */
-  List<Network> listNetworks() throws DockerException, InterruptedException;
+  List<Network> listNetworks(ListNetworksParam... params)
+      throws DockerException, InterruptedException;
 
+  /**
+   * Parameters for {@link #listNetworks(ListNetworksParam...)}
+   * @since Docker 1.10, API version 1.22
+   */
+  class ListNetworksParam extends Param {
+
+    private ListNetworksParam(final String name, final String value) {
+      super(name, value);
+    }
+    
+    /**
+     * Create a custom filter.
+     * @param name of filter
+     * @param value of filter
+     * @return ListNetworksParam
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam filter(final String name, final String value) {
+      return new ListNetworksFilterParam(name, value);
+    }
+
+    /**
+     * Filter networks by ID.
+     * @param id Matches all or part of a network ID.
+     * @return The ListNetworksParam for the given ID.
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam byNetworkId(final String id) {
+      return filter("id", id);
+    }
+
+    /**
+     * Filter networks by name.
+     * @param name Matches all or part of a network name.
+     * @return The ListNetworksParam for the given name.
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam byNetworkName(final String name) {
+      return filter("name", name);
+    }
+
+    /**
+     * Filter networks by network driver.
+     * @param driver The network driver name.
+     * @return The ListNetworksParam for the given driver.
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withDriver(final String driver) {
+      return filter("driver", driver);
+    }
+
+    /**
+     * Filter networks by network type.
+     * There are two types of networks: those built-in into Docker
+     * and custom networks created by users.
+     * @param type The network type.
+     * @return The ListNetworksParam for the given type.
+     * @see #builtInNetworks()
+     * @see #customNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam withType(final Network.Type type) {
+      return filter("type", type.getName());
+    }
+
+    /**
+     * Return built-in networks only.
+     * @return The ListNetworksParam for built-in networks.
+     * @see #withType(com.spotify.docker.client.messages.Network.Type)
+     * @see #customNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam builtInNetworks() {
+      return withType(BUILTIN);
+    }
+
+    /**
+     * Return user-defined (custom) networks only.
+     * @return The ListNetworksParam for user-defined networks.
+     * @see #withType(com.spotify.docker.client.messages.Network.Type)
+     * @see #builtInNetworks()
+     * @since Docker 1.10, API version 1.22
+     */
+    public static ListNetworksParam customNetworks() {
+      return withType(CUSTOM);
+    }
+
+    /**
+     * Return networks with a label value.
+     * @param label The label to filter on
+     * @param value The value of the label
+     * @return ListNetworksParam
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withLabel(String label, String value) {
+      return isNullOrEmpty(value) ? filter("label", label) : filter("label", label + "=" + value);
+    }
+
+    /**
+     * Return networks with a label.
+     * @param label The label to filter on
+     * @return ListNetworksParam
+     * @since Docker 1.12, API version 1.24
+     */
+    public static ListNetworksParam withLabel(String label) {
+      return withLabel(label, null);
+    }
+  }
+  
+  /**
+   * Filter parameter for {@link #listNetworks(ListNetworksParam...)}.
+   * This should be used by ListNetworksParam only.
+   * @since Docker 1.10, API version 1.22
+   */
+  class ListNetworksFilterParam extends ListNetworksParam implements FilterParam {
+    
+    private ListNetworksFilterParam(String name, String value) {
+      super(name, value);
+    }
+    
+  }
+  
   /**
    * Inspect a specific network.
    *
@@ -2023,7 +2424,7 @@ public interface DockerClient extends Closeable {
     }
   }
 
-  class ListContainersFilterParam extends ListContainersParam {
+  class ListContainersFilterParam extends ListContainersParam implements FilterParam {
 
     public ListContainersFilterParam(String name, String value) {
       super(name, value);
@@ -2145,7 +2546,7 @@ public interface DockerClient extends Closeable {
    * Filter parameter for {@link #listImages(ListImagesParam...)}. This should be used by
    * ListImagesParam only.
    */
-  class ListImagesFilterParam extends ListImagesParam {
+  class ListImagesFilterParam extends ListImagesParam implements FilterParam {
 
     public ListImagesFilterParam(String name, String value) {
       super(name, value);
@@ -2155,32 +2556,10 @@ public interface DockerClient extends Closeable {
   /**
    * Parameters for {@link #events(EventsParam...)}
    */
-  class EventsParam {
-
-    private final String name;
-    private final String value;
+  class EventsParam extends Param {
 
     private EventsParam(final String name, final String value) {
-      this.name = name;
-      this.value = value;
-    }
-
-    /**
-     * Parameter name.
-     *
-     * @return The name
-     */
-    public String name() {
-      return name;
-    }
-
-    /**
-     * Parameter value.
-     *
-     * @return The value
-     */
-    public String value() {
-      return value;
+      super(name, value);
     }
 
     /**
@@ -2326,7 +2705,7 @@ public interface DockerClient extends Closeable {
   /**
    * Filter parameter for {@link #events(EventsParam...)}. This should be used by EventsParam only.
    */
-  class EventsFilterParam extends EventsParam {
+  class EventsFilterParam extends EventsParam implements FilterParam {
 
     public EventsFilterParam(String name, String value) {
       super(name, value);
@@ -2454,7 +2833,7 @@ public interface DockerClient extends Closeable {
    * ListVolumesParam only.
    * @since Docker 1.9, API version 1.21
    */
-  class ListVolumesFilterParam extends ListVolumesParam {
+  class ListVolumesFilterParam extends ListVolumesParam implements FilterParam {
     public ListVolumesFilterParam(String name, String value) {
       super(name, value);
     }
@@ -2467,6 +2846,61 @@ public interface DockerClient extends Closeable {
    * 
    * @throws DockerException      if a server error occurred (500)
    * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
    */
   List<Node> listNodes() throws DockerException, InterruptedException;
+
+  /**
+   * List swarm nodes that match the given criteria. Only available in Docker API &gt;= 1.24.
+   *
+   * @param criteria Node listing and filtering options.
+   * @return A list of nodes.
+   *
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
+   */
+  List<Node> listNodes(final Node.Criteria criteria) throws DockerException, InterruptedException;
+
+  /**
+   * Inspects a swarm node. Only available in Docker API &gt;= 1.24.
+   *
+   * @param nodeId The id of the swarm node to inspect
+   * @return info about the node
+   *
+   * @throws NonSwarmNodeException if the node is not part of a swarm (503)
+   * @throws DockerException      if a server error occurred (500)
+   * @throws InterruptedException if the thread is interrupted
+   * @since Docker 1.12, API Version 1.24
+   */
+  NodeInfo inspectNode(final String nodeId) throws DockerException, InterruptedException;
+
+  /**
+   * Update a swarm node. Only available in Docker API &gt;= 1.24.
+   *
+   * @param nodeId The id of the node to update
+   * @param version The version number of the node object being updated.
+   *                This is required to avoid conflicting writes
+   * @throws NodeNotFoundException If the node doesn't exist (404)
+   * @throws NonSwarmNodeException If the node is not part of a swarm (503)
+   * @throws DockerException If a server error occurred (500)
+   * @throws InterruptedException If the thread is interrupted
+   * @since Docker 1.12, API version 1.24
+   */
+  void updateNode(final String nodeId, final Long version, final NodeSpec nodeSpec)
+      throws DockerException, InterruptedException;
+
+  /**
+   * Remove a node from the swarm.
+   * @param nodeId The id of the node to remove.
+   */
+  void deleteNode(final String nodeId) throws DockerException, InterruptedException;
+
+  /**
+   * Remove a node from the swarm.
+   * @param nodeId The id of the node to remove.
+   * @param force  Forcefully remove the node.
+   */
+  void deleteNode(final String nodeId, final boolean force) throws DockerException,
+                                                                   InterruptedException;
 }

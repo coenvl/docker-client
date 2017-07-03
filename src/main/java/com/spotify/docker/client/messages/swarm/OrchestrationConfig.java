@@ -28,17 +28,34 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.auto.value.AutoValue;
 
+import javax.annotation.Nullable;
+
 
 @AutoValue
 @JsonAutoDetect(fieldVisibility = ANY, getterVisibility = NONE, setterVisibility = NONE)
 public abstract class OrchestrationConfig {
 
+  @Nullable
   @JsonProperty("TaskHistoryRetentionLimit")
   public abstract Integer taskHistoryRetentionLimit();
 
   @JsonCreator
   static OrchestrationConfig create(
       @JsonProperty("TaskHistoryRetentionLimit") final Integer taskHistoryRetentionLimit) {
-    return new AutoValue_OrchestrationConfig(taskHistoryRetentionLimit);
+    return builder()
+        .taskHistoryRetentionLimit(taskHistoryRetentionLimit)
+        .build();
+  }
+
+  @AutoValue.Builder
+  public abstract static class Builder {
+
+    public abstract Builder taskHistoryRetentionLimit(Integer taskHistoryRetentionLimit);
+
+    public abstract OrchestrationConfig build();
+  }
+
+  public static OrchestrationConfig.Builder builder() {
+    return new AutoValue_OrchestrationConfig.Builder();
   }
 }
